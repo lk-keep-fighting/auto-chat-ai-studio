@@ -789,8 +789,100 @@ class VideoProcessor:
                 return last_response
             return ""
         except Exception as e:
-            print(f"❌ 提取响应失败: {e}")
+            logger.error(f"❌ 提取响应失败: {e}")
             return ""
+    
+    def parse_table_response(self, response_text):
+        """解析 AI 响应中的表格数据
+        
+        尝试从响应文本中提取结构化的表格数据
+        支持多种格式：Markdown表格、CSV格式、JSON格式等
+        能够处理空单元格和不完整的行
+        """
+        import re
+        import json
+        
+        if not response_text:
+            return None
+        
+        try:
+            # 方法1：尝试解析 Markdown 表格（改进版，支持空单元格）
+            lines = response_text.strip().split('\n')
+            table_data = []
+            headers = []
+            
+            for i, line in enumerate(lines):
+                # 跳过分隔线
+                if re.match(r'^[\s\-\|]+$', line):
+                    continue
+                
+                # 检查是否是表格行
+                if '|' in line:
+                    # 分割单元格，但保留空单元格
+                    cells = line.split('|')
+                    # 移除首尾的空单元格（Markdown 表格通常以 | 开头和结尾）
+                    if cells and not cells[0].strip():
+                        cells = cells[1:]
+                    if cells and not cells[-1].strip():
+                        cells = cells[:-1]
+                    # 清理每个单元格的空白
+                    cells = [cell.strip() for cell in cells]
+                    
+                    if cells:
+                        if not headers:
+                            # 第一行作为表头
+                            headers = cells
+                            logger.info(f"📋 检测到表头: {headers}")
+                        else:
+                            # 数据行：即使单元格数量不匹配也尝试解析
+                            row_dict = {}
+                            for j, header in enumerate(headers):
+                                # 如果该列有数据，使用数据；否则使用空字符串
+                                if j < len(cells):
+                                    row_dict[header] = cells[j] if cells[j] else ""
+                                else:
+                                    row_dict[header] = ""
+                            table_data.append(row_dict)
+            
+            if table_data:
+                logger.info(f"✅ 解析到 {len(table_data)} 行表格数据")
+                # 显示每列的非空数据统计
+                if headers:
+                    for header in headers:
+                        non_empty = sum(1 for row in table_data if row.get(header, ""))
+                        logger.info(f"  - {header}: {non_empty}/{len(table_data)} 行有数据")
+                return table_data
+            
+            # 方法2：尝试解析 JSON 格式
+            try:
+                # 查找 JSON 数组
+                json_match = re.search(r'\[[\s\S]*\]', response_text)
+                if json_match:
+                    json_data = json.loads(json_match.group())
+                    if isinstance(json_data, list) and json_data:
+                        logger.info(f"✅ 解析到 {len(json_data)} 行 JSON 数据")
+                        return json_data
+            except:
+                pass
+            
+            # 方法3：尝试解析 CSV 格式
+            try:
+                import io
+                csv_data = pd.read_csv(io.StringIO(response_text))
+                if not csv_data.empty:
+                    logger.info(f"✅ 解析到 {len(csv_data)} 行 CSV 数据")
+                    return csv_data.to_dict('records')
+            except:
+                pass
+            
+            logger.warning("⚠️ 无法解析为结构化数据，将保存原始文本")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ 解析表格数据失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
 
     def save_output_data(self, video_name, step_outputs):
         """保存输出数据为 Excel"""
@@ -808,11 +900,23 @@ class VideoProcessor:
             output_file = output_folder / f"step_{step_num}_output.xlsx"
 
             try:
-                # 尝试解析为表格数据
-                # 这里需要根据实际数据格式调整
+                # 如果是字符串，尝试解析为表格数据
                 if isinstance(data, str):
-                    # 如果是文本，保存为单列
-                    df = pd.DataFrame({"输出内容": [data]})
+                    # 尝试解析表格数据
+                    parsed_data = self.parse_table_response(data)
+                    
+                    if parsed_data:
+                        # 成功解析为结构化数据
+                        df = pd.DataFrame(parsed_data)
+                        logger.info(f"📊 步骤 {step_num} 解析到 {len(df)} 行 x {len(df.columns)} 列数据")
+                        
+                        # 显示列名
+                        logger.info(f"📋 列名: {', '.join(df.columns.tolist())}")
+                    else:
+                        # 无法解析，保存为单列文本
+                        df = pd.DataFrame({"输出内容": [data]})
+                        logger.info(f"📝 步骤 {step_num} 保存为原始文本")
+                        
                 elif isinstance(data, dict):
                     df = pd.DataFrame([data])
                 elif isinstance(data, list):
@@ -922,18 +1026,23 @@ class VideoProcessor:
 
     def merge_all_excel_files(self):
         """合并所有输出的 Excel 文件"""
-        print("\n📊 开始合并所有 Excel 文件...")
+        logger.info("📊 开始合并所有 Excel 文件...")
 
         all_data = []
         for folder in self.process_folder.iterdir():
             if folder.is_dir() and folder.name != "videos":
                 for excel_file in folder.glob("*.xlsx"):
+                    # 跳过临时文件（以 .~ 或 ~$ 开头）
+                    if excel_file.name.startswith('.~') or excel_file.name.startswith('~$'):
+                        logger.debug(f"  ⏭️ 跳过临时文件: {excel_file.name}")
+                        continue
+                    
                     try:
                         df = pd.read_excel(excel_file)
                         all_data.append(df)
-                        print(f"  ✅ 读取: {excel_file.name}")
+                        logger.info(f"  ✅ 读取: {excel_file.name}")
                     except Exception as e:
-                        print(f"  ❌ 读取失败 {excel_file.name}: {e}")
+                        logger.warning(f"  ❌ 读取失败 {excel_file.name}: {e}")
 
         if all_data:
             merged_df = pd.concat(all_data, ignore_index=True)
@@ -941,20 +1050,65 @@ class VideoProcessor:
             # 保存到 clips.xlsx
             self.clips_file.parent.mkdir(exist_ok=True)
             merged_df.to_excel(self.clips_file, index=False)
-            print(f"✅ 合并完成，保存到: {self.clips_file}")
+            logger.info(f"✅ 合并完成，保存到: {self.clips_file}")
+            logger.info(f"📊 合并数据: {len(merged_df)} 行 x {len(merged_df.columns)} 列")
             return True
         else:
-            print("❌ 没有找到可合并的文件")
+            logger.warning("❌ 没有找到可合并的文件")
             return False
 
     def run_final_processing(self):
         """运行最终的视频处理脚本"""
         process_script = self.output_folder / "process_video.py"
-        if process_script.exists():
-            print(f"\n🎬 运行最终处理脚本: {process_script}")
-            os.system(f"python3 {process_script}")
-        else:
-            print(f"⚠️ 找不到处理脚本: {process_script}")
+        
+        if not process_script.exists():
+            logger.warning(f"⚠️ 找不到处理脚本: {process_script}")
+            return
+        
+        logger.info("\n" + "="*60)
+        logger.info("🎬 准备运行最终处理脚本")
+        logger.info("="*60)
+        logger.info(f"📄 脚本路径: {process_script}")
+        logger.info("")
+        logger.warning("⚠️ 重要提示:")
+        logger.warning("  1. process_video.py 需要正确配置资源文件夹才能运行")
+        logger.warning("  2. 需要配置以下路径:")
+        logger.warning("     - FONT_PATH: 字体文件路径")
+        logger.warning("     - MUSIC_DIR: 音乐文件夹路径")
+        logger.warning("     - FFMPEG_CMD: FFmpeg 命令路径")
+        logger.warning("  3. 如果配置不正确，脚本会报错（这是正常的）")
+        logger.warning("  4. 请根据实际情况修改 process_video.py 中的配置")
+        logger.info("")
+        logger.info("🚀 开始执行...")
+        logger.info("="*60)
+        
+        try:
+            # 执行脚本
+            result = os.system(f"python3 {process_script}")
+            
+            if result == 0:
+                logger.info("="*60)
+                logger.info("✅ 最终处理脚本执行成功")
+                logger.info("="*60)
+            else:
+                logger.warning("="*60)
+                logger.warning("⚠️ 最终处理脚本执行失败")
+                logger.warning("="*60)
+                logger.warning("可能的原因:")
+                logger.warning("  1. 资源文件夹配置不正确")
+                logger.warning("  2. 缺少必需的文件（字体、音乐等）")
+                logger.warning("  3. FFmpeg 未安装或路径不正确")
+                logger.warning("")
+                logger.warning("解决方案:")
+                logger.warning("  1. 检查 process_video.py 中的配置")
+                logger.warning("  2. 确保所有资源文件存在")
+                logger.warning("  3. 安装并配置 FFmpeg")
+                logger.warning("")
+                logger.info("💡 提示: 如果只需要提取数据，可以忽略此错误")
+                
+        except Exception as e:
+            logger.error(f"❌ 执行脚本时出错: {e}")
+            logger.warning("💡 这是预期的错误，如果资源文件夹未配置")
 
     def run(self, headless=None, use_system_chrome=None):
         """运行完整的自动化流程"""
