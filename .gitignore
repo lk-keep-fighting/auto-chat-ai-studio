@@ -22,7 +22,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
+files/
 # Playwright
 playwright-report/
 test-results/
