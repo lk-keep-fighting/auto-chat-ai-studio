@@ -5,6 +5,21 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.3.8] - 2024-12-05
+
+### 新增
+
+#### 打包功能 ⭐⭐⭐
+- ✅ 添加 PyInstaller 打包支持
+- ✅ 创建打包脚本（build.py, build.sh, build.bat）
+- ✅ 创建打包配置文件（build.spec）
+- ✅ 自动检查和安装依赖
+- ✅ 支持 Windows/macOS/Linux
+- ✅ 生成独立可执行文件
+- ✅ 详细的打包文档
+
+---
+
 ## [1.3.7] - 2024-12-05
 
 ### 修复
