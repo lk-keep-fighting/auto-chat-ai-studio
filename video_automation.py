@@ -57,6 +57,10 @@ class VideoProcessor:
         # Content blocked 处理标记
         self.content_blocked_handled = False
         self.last_blocked_time = 0
+        
+        # 账号切换记录
+        self.switched_accounts = set()  # 记录已切换过的账号
+        self.current_account = None  # 当前使用的账号
 
         # 确保目录存在
         ensure_directories()
@@ -376,10 +380,22 @@ class VideoProcessor:
         """打开 Google AI Studio 并等待用户确认"""
         logger.info(f"🌐 正在打开 {self.ai_studio_url}")
         try:
-            self.page.goto(self.ai_studio_url, wait_until="domcontentloaded")
-            time.sleep(3)
-            self.take_screenshot("ai_studio_opened")
+            # 使用更长的超时时间和更完整的等待策略
+            self.page.goto(self.ai_studio_url, wait_until="networkidle", timeout=60000)
+            logger.info("⏳ 等待页面完全加载...")
             
+            # 等待页面稳定
+            time.sleep(5)
+            
+            # 等待关键元素加载
+            try:
+                # 等待页面主要内容加载
+                self.page.wait_for_selector('body', state="visible", timeout=10000)
+                logger.info("✅ 页面主体已加载")
+            except:
+                logger.warning("⚠️ 等待页面主体超时，继续执行")
+            
+            self.take_screenshot("ai_studio_opened")
             logger.info("✅ AI Studio 已打开")
             
             # 根据配置决定是否等待用户确认
@@ -395,8 +411,8 @@ class VideoProcessor:
                         return False
                     
                     # 登录后刷新页面
-                    self.page.reload(wait_until="domcontentloaded")
-                    time.sleep(2)
+                    self.page.reload(wait_until="networkidle", timeout=60000)
+                    time.sleep(3)
             
             return True
             
@@ -414,6 +430,10 @@ class VideoProcessor:
             return False
 
         try:
+            # 等待页面完全加载
+            logger.info("⏳ 等待页面加载完成...")
+            time.sleep(3)
+            
             # 步骤1：点击添加按钮（add_circle 图标按钮）
             logger.info("1️⃣ 点击添加按钮...")
             add_button_selectors = [
@@ -427,8 +447,11 @@ class VideoProcessor:
             for selector in add_button_selectors:
                 try:
                     add_button = self.page.locator(selector).first
-                    if add_button.count() > 0 and add_button.is_visible():
-                        break
+                    if add_button.count() > 0:
+                        # 等待按钮可见
+                        add_button.wait_for(state="visible", timeout=10000)
+                        if add_button.is_visible():
+                            break
                 except:
                     continue
 
@@ -440,11 +463,11 @@ class VideoProcessor:
             # 点击添加按钮
             add_button.click()
             logger.info("✅ 已点击添加按钮")
-            time.sleep(1)
+            time.sleep(2)  # 增加等待时间，让菜单完全展开
             self.take_screenshot("add_button_clicked")
 
-            # 步骤2：点击 Upload File 按钮
-            logger.info("2️⃣ 点击 Upload File 按钮...")
+            # 步骤2：等待并点击 Upload File 按钮
+            logger.info("2️⃣ 等待 Upload File 按钮...")
             upload_file_selectors = [
                 'button[aria-label="Upload File"]',
                 'button:has-text("Upload File")',
@@ -452,18 +475,29 @@ class VideoProcessor:
             ]
 
             upload_file_button = None
-            for selector in upload_file_selectors:
-                try:
-                    upload_file_button = self.page.locator(selector).first
-                    if upload_file_button.count() > 0 and upload_file_button.is_visible():
-                        break
-                except:
-                    continue
+            max_wait = 10  # 最多等待 10 秒
+            waited = 0
+            
+            while waited < max_wait and not upload_file_button:
+                for selector in upload_file_selectors:
+                    try:
+                        btn = self.page.locator(selector).first
+                        if btn.count() > 0 and btn.is_visible():
+                            upload_file_button = btn
+                            break
+                    except:
+                        continue
+                
+                if not upload_file_button:
+                    time.sleep(0.5)
+                    waited += 0.5
 
             if not upload_file_button:
                 logger.error("❌ 找不到 Upload File 按钮")
                 self.take_screenshot("error_no_upload_file_button")
                 return False
+
+            logger.info("✅ 找到 Upload File 按钮")
 
             # 步骤3：使用 file chooser 上传文件
             logger.info("3️⃣ 设置文件选择器并上传文件...")
@@ -471,7 +505,7 @@ class VideoProcessor:
             # 使用 file chooser 事件（必须在点击前设置）
             try:
                 # 设置文件选择器监听，然后点击按钮
-                with self.page.expect_file_chooser() as fc_info:
+                with self.page.expect_file_chooser(timeout=30000) as fc_info:
                     upload_file_button.click()
                     logger.info("✅ 已点击 Upload File 按钮")
                 
@@ -508,12 +542,12 @@ class VideoProcessor:
 
             # 步骤4：关闭浮窗菜单
             logger.info("4️⃣ 关闭浮窗菜单...")
-            time.sleep(0.3)  # 等待文件选择完成
+            time.sleep(1)  # 增加等待时间
             try:
                 # 方法1：按 Escape 键关闭菜单
                 self.page.keyboard.press("Escape")
                 logger.info("✅ 已按 Escape 键关闭菜单")
-                time.sleep(0.5)
+                time.sleep(1)
             except Exception as e:
                 logger.warning(f"⚠️ 按 Escape 键失败: {e}")
                 
@@ -522,13 +556,56 @@ class VideoProcessor:
                     # 点击页面中心区域
                     self.page.mouse.click(500, 300)
                     logger.info("✅ 已点击页面关闭菜单")
-                    time.sleep(0.5)
+                    time.sleep(1)
                 except Exception as e2:
                     logger.warning(f"⚠️ 点击关闭菜单失败: {e2}")
             
-            # 等待上传完成
+            # 步骤5：等待上传完成（检测上传进度）
             logger.info("⏳ 等待视频上传完成...")
-            time.sleep(config.WAIT_AFTER_UPLOAD)
+            
+            # 等待上传进度条消失或上传完成
+            upload_wait_time = 0
+            max_upload_wait = config.WAIT_AFTER_UPLOAD * 2  # 最多等待 2 倍时间
+            
+            while upload_wait_time < max_upload_wait:
+                # 检查是否有上传进度指示器
+                try:
+                    # 常见的上传进度指示器
+                    progress_selectors = [
+                        '[role="progressbar"]',
+                        '.upload-progress',
+                        'text="Uploading"',
+                        'text="上传中"',
+                    ]
+                    
+                    uploading = False
+                    for selector in progress_selectors:
+                        try:
+                            indicator = self.page.locator(selector).first
+                            if indicator.count() > 0 and indicator.is_visible():
+                                uploading = True
+                                break
+                        except:
+                            continue
+                    
+                    if not uploading:
+                        # 没有上传指示器，可能已完成
+                        logger.info("✅ 未检测到上传进度指示器，可能已完成")
+                        break
+                    
+                    # 每 5 秒输出一次进度
+                    if upload_wait_time % 5 == 0:
+                        logger.info(f"⏳ 上传中... ({upload_wait_time}/{max_upload_wait} 秒)")
+                    
+                    time.sleep(1)
+                    upload_wait_time += 1
+                    
+                except Exception as e:
+                    logger.debug(f"检查上传进度时出错: {e}")
+                    break
+            
+            # 额外等待确保上传完成
+            time.sleep(3)
             self.take_screenshot("video_uploaded")
 
             logger.info("✅ 视频上传完成")
@@ -688,6 +765,226 @@ class VideoProcessor:
             logger.debug(f"检查 Content blocked 时出错: {e}")
 
         return False
+    
+    def check_rate_limit(self):
+        """检查是否达到速率限制"""
+        try:
+            # 检查 rate limit 错误提示
+            rate_limit_texts = [
+                "You've reached your rate limit",
+                "rate limit",
+                "请稍后再试",
+                "达到速率限制"
+            ]
+            
+            for text in rate_limit_texts:
+                try:
+                    element = self.page.get_by_text(text, exact=False).first
+                    if element.is_visible(timeout=1000):
+                        logger.warning(f"⚠️ 检测到速率限制: {text}")
+                        self.take_screenshot("rate_limit_detected")
+                        return True
+                except:
+                    continue
+            
+            return False
+            
+        except Exception as e:
+            logger.debug(f"检查速率限制时出错: {e}")
+            return False
+    
+    def get_current_account(self):
+        """获取当前登录的账号"""
+        try:
+            # 查找账号切换按钮，从中提取账号信息
+            account_button_selectors = [
+                'button.account-switcher-button',
+                'button[class*="account-switcher"]',
+            ]
+            
+            for selector in account_button_selectors:
+                try:
+                    button = self.page.locator(selector).first
+                    if button.count() > 0 and button.is_visible():
+                        # 提取账号文本
+                        account_text = button.inner_text()
+                        # 通常是邮箱格式
+                        if '@' in account_text:
+                            return account_text.strip()
+                except:
+                    continue
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"获取当前账号时出错: {e}")
+            return None
+    
+    def switch_account(self):
+        """切换 Google 账号"""
+        logger.info("\n" + "="*60)
+        logger.info("🔄 开始切换账号")
+        logger.info("="*60)
+        
+        try:
+            # 步骤1：获取当前账号
+            current_account = self.get_current_account()
+            if current_account:
+                logger.info(f"📧 当前账号: {current_account}")
+                self.switched_accounts.add(current_account)
+            else:
+                logger.warning("⚠️ 无法获取当前账号")
+            
+            # 步骤2：点击账号切换按钮
+            logger.info("1️⃣ 点击账号切换按钮...")
+            account_button_selectors = [
+                'button.account-switcher-button',
+                'button[class*="account-switcher"]',
+                'button[ms-button][variant="borderless"]',
+            ]
+            
+            account_button = None
+            for selector in account_button_selectors:
+                try:
+                    button = self.page.locator(selector).first
+                    if button.count() > 0 and button.is_visible():
+                        account_button = button
+                        break
+                except:
+                    continue
+            
+            if not account_button:
+                logger.error("❌ 找不到账号切换按钮")
+                self.take_screenshot("error_no_account_button")
+                return False
+            
+            account_button.click()
+            logger.info("✅ 已点击账号切换按钮")
+            time.sleep(2)
+            self.take_screenshot("account_menu_opened")
+            
+            # 步骤3：点击"切换账号"按钮
+            logger.info("2️⃣ 点击切换账号按钮...")
+            switch_button_selectors = [
+                'button.switch-account-button',
+                'button:has-text("切换账号")',
+                'button:has-text("Switch account")',
+                'button[mat-stroked-button]:has-text("切换账号")',
+            ]
+            
+            switch_button = None
+            max_wait = 5
+            waited = 0
+            
+            while waited < max_wait and not switch_button:
+                for selector in switch_button_selectors:
+                    try:
+                        btn = self.page.locator(selector).first
+                        if btn.count() > 0 and btn.is_visible():
+                            switch_button = btn
+                            break
+                    except:
+                        continue
+                
+                if not switch_button:
+                    time.sleep(0.5)
+                    waited += 0.5
+            
+            if not switch_button:
+                logger.error("❌ 找不到切换账号按钮")
+                self.take_screenshot("error_no_switch_button")
+                return False
+            
+            switch_button.click()
+            logger.info("✅ 已点击切换账号按钮")
+            time.sleep(3)
+            self.take_screenshot("switch_account_clicked")
+            
+            # 步骤4：等待跳转到 Google 账号切换页面
+            logger.info("3️⃣ 等待跳转到账号切换页面...")
+            try:
+                # 等待 URL 变化
+                self.page.wait_for_url("**/accounts.google.com/**", timeout=10000)
+                logger.info("✅ 已跳转到 Google 账号切换页面")
+            except:
+                logger.warning("⚠️ 未检测到 URL 跳转，可能已在账号选择页面")
+            
+            time.sleep(2)
+            self.take_screenshot("google_account_page")
+            
+            # 步骤5：选择下一个可用账号
+            logger.info("4️⃣ 选择下一个可用账号...")
+            
+            # 查找所有可用账号
+            account_selectors = [
+                'div[data-identifier]',  # Google 账号选择器
+                'div[role="link"]',
+                'li[data-email]',
+            ]
+            
+            available_accounts = []
+            for selector in account_selectors:
+                try:
+                    accounts = self.page.locator(selector).all()
+                    for account in accounts:
+                        try:
+                            account_text = account.inner_text()
+                            if '@' in account_text and account_text not in self.switched_accounts:
+                                available_accounts.append((account, account_text))
+                        except:
+                            continue
+                except:
+                    continue
+            
+            if not available_accounts:
+                logger.warning("⚠️ 没有找到可用的账号")
+                logger.info("💡 提示: 可能需要手动选择账号")
+                
+                # 等待用户手动选择
+                logger.info("\n请手动选择一个账号，然后按 Enter 继续...")
+                try:
+                    input("👉 选择完成后按 Enter: ")
+                except KeyboardInterrupt:
+                    return False
+            else:
+                # 自动选择第一个未使用的账号
+                next_account, next_account_text = available_accounts[0]
+                logger.info(f"📧 选择账号: {next_account_text}")
+                
+                next_account.click()
+                logger.info("✅ 已点击账号")
+                
+                # 记录已切换的账号
+                self.switched_accounts.add(next_account_text)
+                self.current_account = next_account_text
+            
+            # 步骤6：等待返回 AI Studio
+            logger.info("5️⃣ 等待返回 AI Studio...")
+            time.sleep(5)
+            
+            try:
+                # 等待返回 AI Studio
+                self.page.wait_for_url("**/aistudio.google.com/**", timeout=30000)
+                logger.info("✅ 已返回 AI Studio")
+            except:
+                logger.warning("⚠️ 未检测到返回 AI Studio，可能需要手动操作")
+            
+            time.sleep(3)
+            self.take_screenshot("account_switched")
+            
+            logger.info("="*60)
+            logger.info("✅ 账号切换完成")
+            logger.info(f"📊 已切换账号数: {len(self.switched_accounts)}")
+            logger.info("="*60)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ 切换账号失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self.take_screenshot("error_switch_account")
+            return False
 
     def is_ai_running(self):
         """检查 AI 是否正在运行（通过按钮状态判断）"""
@@ -725,7 +1022,7 @@ class VideoProcessor:
             return False
     
     def wait_for_response(self, timeout=None, step_number=None):
-        """等待 AI 响应完成 - 通过检测按钮状态"""
+        """等待 AI 响应完成 - 通过检测按钮状态，并处理 rate limit"""
         if timeout is None:
             timeout = config.WAIT_FOR_RESPONSE * 6  # 默认 60 秒
 
@@ -737,6 +1034,45 @@ class VideoProcessor:
         last_status_log = 0
 
         while time.time() - start_time < timeout:
+            # 检查是否达到速率限制
+            if self.check_rate_limit():
+                logger.warning("⚠️ 检测到速率限制，尝试切换账号...")
+                
+                # 尝试切换账号
+                if self.switch_account():
+                    logger.info("✅ 账号切换成功，重新发送请求")
+                    # 返回特殊标记，让调用者知道需要重新发送
+                    return "rate_limit_switched"
+                else:
+                    logger.error("❌ 账号切换失败")
+                    # 询问用户如何处理
+                    logger.info("\n可选操作:")
+                    logger.info("  1. 输入 'retry' - 重试切换账号")
+                    logger.info("  2. 输入 'manual' - 手动切换后继续")
+                    logger.info("  3. 输入 'skip' - 跳过当前视频")
+                    logger.info("  4. 输入 'quit' - 退出程序")
+                    
+                    try:
+                        user_input = input("\n👉 请输入操作: ").strip().lower()
+                        
+                        if user_input == 'retry':
+                            if self.switch_account():
+                                return "rate_limit_switched"
+                        elif user_input == 'manual':
+                            logger.info("请手动切换账号，完成后按 Enter 继续...")
+                            input("👉 按 Enter 继续: ")
+                            return "rate_limit_switched"
+                        elif user_input == 'skip':
+                            return "skip"
+                        elif user_input == 'quit':
+                            return "quit"
+                    except KeyboardInterrupt:
+                        return "quit"
+                
+                # 重置计时器
+                start_time = time.time()
+                continue
+            
             # 检查是否被阻止
             if self.check_content_blocked():
                 start_time = time.time()  # 重置计时器
@@ -941,8 +1277,62 @@ class VideoProcessor:
 
         return output_folder
 
-    def process_single_video(self, video_info, retry_count=0):
-        """处理单个视频的完整流程"""
+    def wait_for_user_action(self, error_msg, current_step=None):
+        """等待用户处理错误后继续"""
+        logger.error(f"\n{'='*60}")
+        logger.error(f"❌ 错误: {error_msg}")
+        logger.error(f"{'='*60}")
+        
+        if current_step:
+            logger.info(f"📍 当前步骤: {current_step}")
+        
+        logger.info("\n可选操作:")
+        logger.info("  1. 输入步骤号 (1-25) - 从指定步骤继续")
+        logger.info("  2. 输入 'retry' - 重试当前步骤")
+        logger.info("  3. 输入 'skip' - 跳过当前视频")
+        logger.info("  4. 输入 'quit' - 退出程序")
+        logger.info("  5. 直接按 Enter - 继续下一步")
+        
+        while True:
+            try:
+                user_input = input("\n👉 请输入操作: ").strip().lower()
+                
+                if not user_input:
+                    # 直接按 Enter，继续
+                    logger.info("✅ 继续执行...")
+                    return "continue", None
+                
+                elif user_input == 'retry':
+                    logger.info("🔄 重试当前步骤...")
+                    return "retry", current_step
+                
+                elif user_input == 'skip':
+                    logger.info("⏭️ 跳过当前视频...")
+                    return "skip", None
+                
+                elif user_input == 'quit':
+                    logger.info("👋 退出程序...")
+                    return "quit", None
+                
+                elif user_input.isdigit():
+                    step_num = int(user_input)
+                    if 1 <= step_num <= 25:
+                        logger.info(f"↪️ 从步骤 {step_num} 继续...")
+                        return "goto", step_num
+                    else:
+                        logger.warning("⚠️ 步骤号必须在 1-25 之间")
+                
+                else:
+                    logger.warning("⚠️ 无效的输入，请重新输入")
+                    
+            except KeyboardInterrupt:
+                logger.warning("\n⚠️ 用户中断")
+                return "quit", None
+            except Exception as e:
+                logger.error(f"❌ 输入错误: {e}")
+
+    def process_single_video(self, video_info, start_step=1):
+        """处理单个视频的完整流程（支持错误恢复）"""
         video_name = video_info["filename"]
         duration = video_info["duration"]
         video_path = self.videos_folder / video_name
@@ -956,73 +1346,202 @@ class VideoProcessor:
 
         try:
             # 1. 更新提示词文件
-            if not self.update_prompts_file(video_name, duration):
-                logger.error("更新提示词文件失败")
-                return False
+            if start_step <= 1:
+                try:
+                    if not self.update_prompts_file(video_name, duration):
+                        action, step = self.wait_for_user_action("更新提示词文件失败", 1)
+                        if action == "quit":
+                            return False
+                        elif action == "skip":
+                            return False
+                        elif action == "retry":
+                            return self.process_single_video(video_info, start_step=1)
+                        elif action == "goto":
+                            return self.process_single_video(video_info, start_step=step)
+                except Exception as e:
+                    action, step = self.wait_for_user_action(f"更新提示词文件异常: {e}", 1)
+                    if action == "quit":
+                        return False
+                    elif action == "skip":
+                        return False
+                    elif action == "retry":
+                        return self.process_single_video(video_info, start_step=1)
 
             # 2. 获取提示词列表
             prompts = self.get_prompts_list()
             if not prompts:
-                logger.error("❌ 没有找到提示词")
+                action, step = self.wait_for_user_action("没有找到提示词", 1)
+                if action == "quit":
+                    return False
+                elif action == "skip":
+                    return False
                 return False
 
             logger.info(f"共有 {len(prompts)} 个提示词需要处理")
 
-            # 3. 打开 AI Studio
-            if not self.open_ai_studio():
-                return False
+            # 3. 打开 AI Studio（如果需要）
+            if start_step <= 1:
+                try:
+                    if not self.open_ai_studio():
+                        action, step = self.wait_for_user_action("打开 AI Studio 失败", 1)
+                        if action == "quit":
+                            return False
+                        elif action == "skip":
+                            return False
+                        elif action == "retry":
+                            return self.process_single_video(video_info, start_step=1)
+                except Exception as e:
+                    action, step = self.wait_for_user_action(f"打开 AI Studio 异常: {e}", 1)
+                    if action == "quit":
+                        return False
+                    elif action == "skip":
+                        return False
 
-            # 4. 上传视频
-            if not self.upload_video(video_path):
-                return False
+            # 4. 上传视频（如果需要）
+            if start_step <= 1:
+                try:
+                    if not self.upload_video(video_path):
+                        action, step = self.wait_for_user_action("上传视频失败", 1)
+                        if action == "quit":
+                            return False
+                        elif action == "skip":
+                            return False
+                        elif action == "retry":
+                            return self.process_single_video(video_info, start_step=1)
+                        elif action == "goto":
+                            return self.process_single_video(video_info, start_step=step)
+                except Exception as e:
+                    action, step = self.wait_for_user_action(f"上传视频异常: {e}", 1)
+                    if action == "quit":
+                        return False
+                    elif action == "skip":
+                        return False
 
             # 5. 发送第一个提示词并运行
-            if prompts:
-                if not self.send_prompt(prompts[0], step_number=1):
-                    return False
-                self.wait_for_response(step_number=1)
+            if start_step <= 1 and prompts:
+                try:
+                    if not self.send_prompt(prompts[0], step_number=1):
+                        action, step = self.wait_for_user_action("发送步骤1失败", 1)
+                        if action == "quit":
+                            return False
+                        elif action == "skip":
+                            return False
+                        elif action == "retry":
+                            return self.process_single_video(video_info, start_step=1)
+                        elif action == "goto":
+                            return self.process_single_video(video_info, start_step=step)
+                    
+                    # 等待响应，处理 rate limit
+                    response_result = self.wait_for_response(step_number=1)
+                    
+                    # 处理 rate limit 切换账号的情况
+                    if response_result == "rate_limit_switched":
+                        logger.info("🔄 账号已切换，重新发送步骤1")
+                        return self.process_single_video(video_info, start_step=1)
+                    elif response_result == "skip":
+                        logger.info("⏭️ 跳过当前视频")
+                        return False
+                    elif response_result == "quit":
+                        logger.info("👋 退出程序")
+                        return False
+                except Exception as e:
+                    action, step = self.wait_for_user_action(f"步骤1异常: {e}", 1)
+                    if action == "quit":
+                        return False
+                    elif action == "skip":
+                        return False
+                    elif action == "retry":
+                        return self.process_single_video(video_info, start_step=1)
 
             # 6. 逐步发送剩余提示词（步骤2-25）
             step_outputs = {}
 
             for i, prompt in enumerate(prompts[1:], start=2):
+                # 如果指定了起始步骤，跳过之前的步骤
+                if i < start_step:
+                    continue
+                
                 logger.info(f"\n{'─'*40}")
                 logger.info(f"📝 步骤 {i}/{len(prompts)}")
                 logger.info(f"{'─'*40}")
 
-                if not self.send_prompt(prompt, step_number=i):
-                    logger.warning(f"步骤 {i} 发送失败，尝试继续...")
-                    continue
+                try:
+                    if not self.send_prompt(prompt, step_number=i):
+                        action, step = self.wait_for_user_action(f"步骤 {i} 发送失败", i)
+                        if action == "quit":
+                            return False
+                        elif action == "skip":
+                            return False
+                        elif action == "retry":
+                            return self.process_single_video(video_info, start_step=i)
+                        elif action == "goto":
+                            return self.process_single_video(video_info, start_step=step)
+                        elif action == "continue":
+                            continue
 
-                self.wait_for_response(step_number=i)
+                    # 等待响应，处理 rate limit
+                    response_result = self.wait_for_response(step_number=i)
+                    
+                    # 处理 rate limit 切换账号的情况
+                    if response_result == "rate_limit_switched":
+                        logger.info("🔄 账号已切换，重新发送当前步骤")
+                        return self.process_single_video(video_info, start_step=i)
+                    elif response_result == "skip":
+                        logger.info("⏭️ 跳过当前视频")
+                        return False
+                    elif response_result == "quit":
+                        logger.info("👋 退出程序")
+                        return False
 
-                # 保存特定步骤的输出
-                if i in config.SAVE_STEPS:
-                    response = self.extract_response()
-                    step_outputs[i] = response
-                    logger.info(f"💾 已捕获步骤 {i} 的输出")
-                    self.take_screenshot(f"step_{i}_output")
+                    # 保存特定步骤的输出
+                    if i in config.SAVE_STEPS:
+                        response = self.extract_response()
+                        step_outputs[i] = response
+                        logger.info(f"💾 已捕获步骤 {i} 的输出")
+                        self.take_screenshot(f"step_{i}_output")
+                        
+                except Exception as e:
+                    action, step = self.wait_for_user_action(f"步骤 {i} 异常: {e}", i)
+                    if action == "quit":
+                        return False
+                    elif action == "skip":
+                        return False
+                    elif action == "retry":
+                        return self.process_single_video(video_info, start_step=i)
+                    elif action == "goto":
+                        return self.process_single_video(video_info, start_step=step)
+                    elif action == "continue":
+                        continue
 
             # 7. 保存输出数据
-            self.save_output_data(video_name, step_outputs)
+            try:
+                self.save_output_data(video_name, step_outputs)
+            except Exception as e:
+                logger.error(f"❌ 保存输出数据失败: {e}")
+                action, step = self.wait_for_user_action(f"保存数据异常: {e}", 25)
+                if action == "quit":
+                    return False
 
             logger.info(f"✅ 视频 {video_name} 处理完成")
             return True
 
         except Exception as e:
             logger.error(f"❌ 处理视频时出错: {e}")
+            import traceback
+            traceback.print_exc()
             self.take_screenshot("error_process_video")
-
-            # 重试逻辑
-            if retry_count < config.MAX_RETRIES:
-                logger.info(
-                    f"⏳ {config.RETRY_DELAY} 秒后重试 ({retry_count + 1}/{config.MAX_RETRIES})..."
-                )
-                time.sleep(config.RETRY_DELAY)
-                return self.process_single_video(video_info, retry_count + 1)
-            else:
-                logger.error(f"❌ 已达到最大重试次数，跳过视频: {video_name}")
+            
+            action, step = self.wait_for_user_action(f"处理视频异常: {e}", start_step)
+            if action == "quit":
                 return False
+            elif action == "skip":
+                return False
+            elif action == "retry":
+                return self.process_single_video(video_info, start_step=start_step)
+            elif action == "goto":
+                return self.process_single_video(video_info, start_step=step)
+            
+            return False
 
     def merge_all_excel_files(self):
         """合并所有输出的 Excel 文件"""
@@ -1110,64 +1629,118 @@ class VideoProcessor:
             logger.error(f"❌ 执行脚本时出错: {e}")
             logger.warning("💡 这是预期的错误，如果资源文件夹未配置")
 
-    def run(self, headless=None, use_system_chrome=None):
-        """运行完整的自动化流程"""
-        logger.info("🚀 视频处理自动化开始")
-        logger.info(f"📁 工作目录: {self.base_dir}")
-        logger.info(f"📝 日志文件: {config.LOG_FILE}")
-
+    def run_batch(self):
+        """运行一批视频的处理流程"""
         # 1. 加载视频列表
         videos = self.load_video_list()
         if not videos:
             logger.error("❌ 没有找到待处理的视频")
-            return
-
-        # 2. 初始化浏览器
-        if use_system_chrome is None:
-            use_system_chrome = config.USE_SYSTEM_CHROME
-        self.init_browser(headless=headless, use_system_chrome=use_system_chrome)
+            return False
 
         success_count = 0
         failed_videos = []
 
+        # 2. 处理每个视频
+        for i, video_info in enumerate(videos, start=1):
+            logger.info(f"\n{'#'*60}")
+            logger.info(f"# 进度: {i}/{len(videos)}")
+            logger.info(f"# 视频: {video_info['filename']}")
+            logger.info(f"{'#'*60}")
+
+            result = self.process_single_video(video_info)
+            
+            # 检查是否用户要求退出
+            if result == "quit":
+                logger.info("👋 用户请求退出")
+                return "quit"
+            
+            if result:
+                success_count += 1
+            else:
+                failed_videos.append(video_info["filename"])
+
+            # 每个视频之间稍作休息
+            if i < len(videos):
+                logger.info(f"\n⏸️ 休息 {config.WAIT_BETWEEN_VIDEOS} 秒...")
+                time.sleep(config.WAIT_BETWEEN_VIDEOS)
+
+        # 3. 合并所有 Excel 文件
+        logger.info("\n" + "=" * 60)
+        logger.info("开始合并数据...")
+        logger.info("=" * 60)
         try:
-            # 3. 处理每个视频
-            for i, video_info in enumerate(videos, start=1):
-                logger.info(f"\n{'#'*60}")
-                logger.info(f"# 进度: {i}/{len(videos)}")
-                logger.info(f"# 视频: {video_info['filename']}")
-                logger.info(f"{'#'*60}")
-
-                if self.process_single_video(video_info):
-                    success_count += 1
-                else:
-                    failed_videos.append(video_info["filename"])
-
-                # 每个视频之间稍作休息
-                if i < len(videos):
-                    logger.info(f"\n⏸️ 休息 {config.WAIT_BETWEEN_VIDEOS} 秒...")
-                    time.sleep(config.WAIT_BETWEEN_VIDEOS)
-
-            # 4. 合并所有 Excel 文件
-            logger.info("\n" + "=" * 60)
-            logger.info("开始合并数据...")
-            logger.info("=" * 60)
             self.merge_all_excel_files()
+        except Exception as e:
+            logger.error(f"❌ 合并数据失败: {e}")
 
-            # 5. 运行最终处理
-            logger.info("\n" + "=" * 60)
-            logger.info("运行最终处理...")
-            logger.info("=" * 60)
+        # 4. 运行最终处理
+        logger.info("\n" + "=" * 60)
+        logger.info("运行最终处理...")
+        logger.info("=" * 60)
+        try:
             self.run_final_processing()
+        except Exception as e:
+            logger.error(f"❌ 最终处理失败: {e}")
 
-            # 6. 输出统计信息
-            logger.info("\n" + "=" * 60)
-            logger.info("🎉 所有任务完成！")
-            logger.info("=" * 60)
-            logger.info(f"✅ 成功处理: {success_count}/{len(videos)} 个视频")
+        # 5. 输出统计信息
+        logger.info("\n" + "=" * 60)
+        logger.info("🎉 本批次任务完成！")
+        logger.info("=" * 60)
+        logger.info(f"✅ 成功处理: {success_count}/{len(videos)} 个视频")
 
-            if failed_videos:
-                logger.warning(f"❌ 失败视频: {', '.join(failed_videos)}")
+        if failed_videos:
+            logger.warning(f"❌ 失败视频: {', '.join(failed_videos)}")
+        
+        return True
+
+    def run(self, headless=None, use_system_chrome=None):
+        """运行完整的自动化流程（支持循环执行）"""
+        logger.info("🚀 视频处理自动化开始")
+        logger.info(f"📁 工作目录: {self.base_dir}")
+        logger.info(f"📝 日志文件: {config.LOG_FILE}")
+
+        # 初始化浏览器
+        if use_system_chrome is None:
+            use_system_chrome = config.USE_SYSTEM_CHROME
+        
+        try:
+            self.init_browser(headless=headless, use_system_chrome=use_system_chrome)
+        except Exception as e:
+            logger.error(f"❌ 初始化浏览器失败: {e}")
+            return
+
+        try:
+            while True:
+                # 运行一批视频
+                result = self.run_batch()
+                
+                # 如果用户要求退出
+                if result == "quit":
+                    break
+                
+                # 批次完成后，询问用户下一步操作
+                logger.info("\n" + "=" * 60)
+                logger.info("📋 批次完成，请选择下一步操作")
+                logger.info("=" * 60)
+                logger.info("可选操作:")
+                logger.info("  1. 输入 'continue' 或按 Enter - 重新加载 VideoList.csv 并继续")
+                logger.info("  2. 输入 'quit' - 退出程序")
+                
+                while True:
+                    try:
+                        user_input = input("\n👉 请输入操作: ").strip().lower()
+                        
+                        if not user_input or user_input == 'continue':
+                            logger.info("🔄 重新加载视频列表...")
+                            break
+                        elif user_input == 'quit':
+                            logger.info("👋 退出程序...")
+                            return
+                        else:
+                            logger.warning("⚠️ 无效的输入，请输入 'continue' 或 'quit'")
+                    except KeyboardInterrupt:
+                        logger.warning("\n⚠️ 用户中断")
+                        return
 
         except KeyboardInterrupt:
             logger.warning("\n⚠️ 用户中断")
