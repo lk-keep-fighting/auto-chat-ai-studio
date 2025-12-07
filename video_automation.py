@@ -59,8 +59,11 @@ class VideoProcessor:
         self.last_blocked_time = 0
         
         # 账号切换记录
-        self.switched_accounts = set()  # 记录已切换过的账号
+        self.unavailable_accounts = set()  # 记录不可用的账号（遇到rate limit的）
         self.current_account = None  # 当前使用的账号
+        
+        # AI Studio 打开标记
+        self.ai_studio_opened = False  # 标记是否已经打开过 AI Studio
 
         # 确保目录存在
         ensure_directories()
@@ -73,15 +76,27 @@ class VideoProcessor:
 
         try:
             df = pd.read_csv(self.video_list_file)
+            
+            # 清理列名（去除前后空格）
+            df.columns = df.columns.str.strip()
+            
             videos = []
             for _, row in df.iterrows():
-                videos.append(
-                    {"filename": row["Filename"], "duration": row["Duration"]}
-                )
+                video_info = {
+                    "filename": row["Filename"],
+                    "duration": row["Duration"]
+                }
+                # 如果有line1和line2列，也加载进来
+                if "line1" in row:
+                    video_info["line1"] = row["line1"]
+                if "line2" in row:
+                    video_info["line2"] = row["line2"]
+                videos.append(video_info)
             logger.info(f"✅ 加载了 {len(videos)} 个视频")
             return videos
         except Exception as e:
             logger.error(f"❌ 读取视频列表失败: {e}")
+            logger.error(f"   可用的列名: {list(df.columns) if 'df' in locals() else '无法读取'}")
             return []
 
     def load_prompts(self):
@@ -98,20 +113,40 @@ class VideoProcessor:
             logger.error(f"❌ 读取提示词文件失败: {e}")
             return None
 
-    def update_prompts_file(self, video_name, duration):
-        """更新提示词文件中的视频名称和时长"""
+    def update_prompts_file(self, video_info):
+        """更新提示词文件中的视频信息
+        
+        Args:
+            video_info: 字典，包含 filename, duration, line1, line2 等字段
+        """
         df = self.load_prompts()
         if df is None:
             return False
 
-        # 假设文件中有 '文件名称' 和 '视频时长' 列
-        if "文件名称" in df.columns:
-            df.loc[0, "文件名称"] = video_name
+        # 更新视频名称
+        if "视频名称" in df.columns:
+            df.loc[0, "视频名称"] = video_info.get("filename", "")
+        
+        # 更新视频时长
         if "视频时长" in df.columns:
-            df.loc[0, "视频时长"] = duration
+            df.loc[0, "视频时长"] = video_info.get("duration", "")
+        
+        # 更新line1
+        if "line1" in df.columns and "line1" in video_info:
+            df.loc[0, "line1"] = video_info.get("line1", "")
+        
+        # 更新line2（注意Excel中可能是lin2的拼写错误）
+        if "line2" in df.columns and "line2" in video_info:
+            df.loc[0, "line2"] = video_info.get("line2", "")
+        elif "lin2" in df.columns and "line2" in video_info:
+            df.loc[0, "lin2"] = video_info.get("line2", "")
 
         df.to_excel(self.prompts_file, index=False)
-        print(f"✅ 更新提示词文件: {video_name} - {duration}")
+        logger.info(f"✅ 更新提示词文件: {video_info.get('filename')} - {video_info.get('duration')}")
+        if "line1" in video_info:
+            logger.info(f"   line1: {video_info.get('line1')}")
+        if "line2" in video_info:
+            logger.info(f"   line2: {video_info.get('line2')}")
         return True
 
     def get_prompts_list(self):
@@ -377,7 +412,7 @@ class VideoProcessor:
             return False
     
     def open_ai_studio(self):
-        """打开 Google AI Studio 并等待用户确认"""
+        """打开 Google AI Studio 并等待用户确认（仅首次）"""
         logger.info(f"🌐 正在打开 {self.ai_studio_url}")
         try:
             # 使用更长的超时时间和更完整的等待策略
@@ -398,11 +433,16 @@ class VideoProcessor:
             self.take_screenshot("ai_studio_opened")
             logger.info("✅ AI Studio 已打开")
             
-            # 根据配置决定是否等待用户确认
-            if config.WAIT_USER_CONFIRMATION:
+            # 只在首次打开时等待用户确认
+            if config.WAIT_USER_CONFIRMATION and not self.ai_studio_opened:
+                logger.info("📝 首次打开 AI Studio，需要用户确认")
                 if not self.wait_for_user_confirmation():
                     logger.error("❌ 用户未确认，终止操作")
                     return False
+                # 标记已经打开过
+                self.ai_studio_opened = True
+            elif self.ai_studio_opened:
+                logger.info("✅ 非首次打开，跳过用户确认")
             else:
                 # 不需要用户确认，自动检测登录状态
                 if not self.check_login_status():
@@ -413,6 +453,9 @@ class VideoProcessor:
                     # 登录后刷新页面
                     self.page.reload(wait_until="networkidle", timeout=60000)
                     time.sleep(3)
+                
+                # 标记已经打开过
+                self.ai_studio_opened = True
             
             return True
             
@@ -421,6 +464,73 @@ class VideoProcessor:
             self.take_screenshot("error_open_ai_studio")
             return False
 
+    def check_and_close_upload_popup(self):
+        """检查上传后是否有弹窗（如版权确认），如果有则关闭"""
+        try:
+            # 等待一下，让弹窗有时间出现
+            time.sleep(2)
+            
+            # 检查是否有 Acknowledge 按钮（版权确认弹窗）
+            acknowledge_selectors = [
+                'button[aria-label*="Acknowledge"]',
+                'button[aria-label*="acknowledgement"]',
+                'button:has-text("Acknowledge")',
+                'button.ms-button-primary:has-text("Acknowledge")',
+            ]
+            
+            for selector in acknowledge_selectors:
+                try:
+                    button = self.page.locator(selector).first
+                    if button.count() > 0 and button.is_visible(timeout=2000):
+                        logger.warning("⚠️ 检测到上传后的弹窗（版权确认）")
+                        self.take_screenshot("upload_popup_detected")
+                        
+                        # 点击 Acknowledge 按钮
+                        button.click(timeout=5000)
+                        logger.info("✅ 已点击 Acknowledge 按钮")
+                        time.sleep(2)
+                        self.take_screenshot("upload_popup_closed")
+                        
+                        return True  # 返回 True 表示有弹窗并已关闭
+                except:
+                    continue
+            
+            # 没有检测到弹窗
+            logger.debug("✅ 未检测到上传后的弹窗")
+            return False
+            
+        except Exception as e:
+            logger.debug(f"检查上传弹窗时出错: {e}")
+            return False
+    
+    def check_video_uploaded(self):
+        """检查视频是否已成功上传到对话中"""
+        try:
+            # 查找视频缩略图或视频元素
+            video_indicators = [
+                'video',  # video 标签
+                '[data-test-id*="video"]',
+                'img[alt*="video"]',
+                '.video-thumbnail',
+                '[role="img"]',
+            ]
+            
+            for selector in video_indicators:
+                try:
+                    element = self.page.locator(selector).first
+                    if element.count() > 0 and element.is_visible(timeout=2000):
+                        logger.debug(f"✅ 检测到视频元素: {selector}")
+                        return True
+                except:
+                    continue
+            
+            logger.warning("⚠️ 未检测到视频元素")
+            return False
+            
+        except Exception as e:
+            logger.debug(f"检查视频上传状态时出错: {e}")
+            return False
+    
     def upload_video(self, video_path):
         """上传视频文件 - 点击添加按钮，然后点击 Upload File"""
         logger.info(f"📤 正在上传视频: {video_path}")
@@ -608,8 +718,22 @@ class VideoProcessor:
             time.sleep(3)
             self.take_screenshot("video_uploaded")
 
-            logger.info("✅ 视频上传完成")
-            return True
+            # 检查是否有弹窗（例如版权确认）
+            logger.info("🔍 检查上传后是否有弹窗...")
+            if self.check_and_close_upload_popup():
+                logger.info("✅ 已处理上传后的弹窗")
+                # 弹窗关闭后，返回特殊标记，让调用者刷新页面重新开始
+                return "popup_closed_need_refresh"
+            
+            # 验证视频是否真正上传成功
+            logger.info("🔍 验证视频上传状态...")
+            if self.check_video_uploaded():
+                logger.info("✅ 视频上传完成并已验证")
+                return True
+            else:
+                logger.warning("⚠️ 视频可能未成功上传（未检测到视频元素）")
+                logger.info("💡 建议：刷新页面重试")
+                return True  # 仍然返回 True，让后续流程检测 Run 按钮状态
 
         except Exception as e:
             logger.error(f"❌ 上传视频失败: {e}")
@@ -705,8 +829,17 @@ class VideoProcessor:
                 
                 # 检查是否超时
                 if waited >= max_wait:
-                    logger.warning(f"⚠️ 等待按钮可用超时（{max_wait} 秒），尝试使用快捷键")
-                    self.page.keyboard.press("Control+Enter")
+                    logger.error(f"❌ 等待按钮可用超时（{max_wait} 秒）")
+                    self.take_screenshot("error_run_button_timeout")
+                    
+                    # 如果是步骤1，说明视频上传可能失败，返回特殊标记
+                    if step_number == 1:
+                        logger.error("❌ 步骤1的 Run 按钮超时不可用，可能视频上传失败")
+                        return "upload_failed"
+                    else:
+                        # 其他步骤尝试使用快捷键
+                        logger.warning("⚠️ 尝试使用快捷键")
+                        self.page.keyboard.press("Control+Enter")
                 else:
                     # 点击 Run 按钮（增加超时时间）
                     try:
@@ -767,22 +900,26 @@ class VideoProcessor:
         return False
     
     def check_rate_limit(self):
-        """检查是否达到速率限制"""
+        """检查是否达到速率限制或配额超限"""
         try:
-            # 检查 rate limit 错误提示
+            # 检查 rate limit 和 quota exceeded 错误提示
             rate_limit_texts = [
                 "You've reached your rate limit",
                 "rate limit",
+                "exceeded quota",  # 新增：配额超限
+                "user has exceeded quota",  # 新增：用户配额超限
+                "Please try again later",  # 新增：请稍后重试
                 "请稍后再试",
-                "达到速率限制"
+                "达到速率限制",
+                "配额已超限",  # 新增：中文配额超限
             ]
             
             for text in rate_limit_texts:
                 try:
                     element = self.page.get_by_text(text, exact=False).first
                     if element.is_visible(timeout=1000):
-                        logger.warning(f"⚠️ 检测到速率限制: {text}")
-                        self.take_screenshot("rate_limit_detected")
+                        logger.warning(f"⚠️ 检测到速率限制或配额超限: {text}")
+                        self.take_screenshot("rate_limit_or_quota_exceeded")
                         return True
                 except:
                     continue
@@ -794,8 +931,11 @@ class VideoProcessor:
             return False
     
     def get_current_account(self):
-        """获取当前登录的账号"""
+        """获取当前登录的账号（增强版，等待页面更新）"""
         try:
+            # 等待页面稳定
+            time.sleep(2)
+            
             # 查找账号切换按钮，从中提取账号信息
             account_button_selectors = [
                 'button.account-switcher-button',
@@ -805,20 +945,150 @@ class VideoProcessor:
             for selector in account_button_selectors:
                 try:
                     button = self.page.locator(selector).first
-                    if button.count() > 0 and button.is_visible():
-                        # 提取账号文本
-                        account_text = button.inner_text()
-                        # 通常是邮箱格式
-                        if '@' in account_text:
-                            return account_text.strip()
-                except:
+                    if button.count() > 0:
+                        # 等待按钮可见
+                        button.wait_for(state="visible", timeout=5000)
+                        
+                        # 提取账号文本 - 尝试多种方法
+                        account_text = None
+                        
+                        # 方法1: 从 inner_text 提取
+                        try:
+                            text = button.inner_text()
+                            if '@' in text:
+                                account_text = text.strip()
+                        except:
+                            pass
+                        
+                        # 方法2: 从子元素中查找邮箱
+                        if not account_text:
+                            try:
+                                # 查找包含 @ 的 span 元素
+                                email_span = button.locator('span:has-text("@")').first
+                                if email_span.count() > 0:
+                                    account_text = email_span.inner_text().strip()
+                            except:
+                                pass
+                        
+                        # 方法3: 从 aria-label 或 title 属性提取
+                        if not account_text:
+                            try:
+                                aria_label = button.get_attribute('aria-label')
+                                if aria_label and '@' in aria_label:
+                                    account_text = aria_label.strip()
+                            except:
+                                pass
+                        
+                        if account_text and '@' in account_text:
+                            logger.debug(f"检测到当前账号: {account_text}")
+                            return account_text
+                except Exception as e:
+                    logger.debug(f"尝试选择器 {selector} 失败: {e}")
                     continue
             
+            logger.warning("⚠️ 无法获取当前账号")
             return None
             
         except Exception as e:
             logger.debug(f"获取当前账号时出错: {e}")
             return None
+    
+    def close_popups(self):
+        """关闭页面上的所有弹窗"""
+        try:
+            logger.info("🔍 检查并关闭弹窗...")
+            
+            # 常见的弹窗关闭按钮选择器
+            close_button_selectors = [
+                # 标准关闭按钮
+                'button[aria-label="Close"]',
+                'button[aria-label="关闭"]',
+                'button[aria-label="Dismiss"]',
+                'button[aria-label="Got it"]',
+                'button[aria-label="OK"]',
+                
+                # 确认/同意按钮
+                'button[aria-label*="Acknowledge"]',  # Acknowledge 按钮
+                'button[aria-label*="acknowledgement"]',
+                'button:has-text("Acknowledge")',
+                'button:has-text("Accept")',
+                'button:has-text("Agree")',
+                'button:has-text("Continue")',
+                'button:has-text("同意")',
+                'button:has-text("接受")',
+                'button:has-text("继续")',
+                
+                # 文本匹配
+                'button:has-text("Close")',
+                'button:has-text("关闭")',
+                'button:has-text("Got it")',
+                'button:has-text("OK")',
+                'button:has-text("知道了")',
+                
+                # 属性匹配
+                '[role="button"][aria-label*="close"]',
+                '[role="button"][aria-label*="Close"]',
+                '[role="button"][aria-label*="Acknowledge"]',
+                
+                # CSS 类匹配
+                '.close-button',
+                '.dismiss-button',
+                'button.mdc-icon-button',  # Material Design 关闭按钮
+                'button.ms-button-primary',  # MS Button Primary（可能是确认按钮）
+                
+                # 对话框内的主要按钮
+                'mat-dialog-actions button',  # Material Dialog 操作按钮
+                '.mat-mdc-dialog-actions button',  # Material Dialog 操作按钮
+            ]
+            
+            closed_count = 0
+            max_attempts = 5  # 最多尝试关闭5次（可能有多个弹窗）
+            
+            for attempt in range(max_attempts):
+                found_popup = False
+                
+                for selector in close_button_selectors:
+                    try:
+                        # 查找所有匹配的关闭按钮
+                        buttons = self.page.locator(selector).all()
+                        
+                        for button in buttons:
+                            try:
+                                # 检查按钮是否可见
+                                if button.is_visible(timeout=1000):
+                                    button.click(timeout=2000)
+                                    closed_count += 1
+                                    found_popup = True
+                                    logger.info(f"✅ 已关闭弹窗 #{closed_count}")
+                                    time.sleep(0.5)  # 等待弹窗关闭动画
+                                    break
+                            except:
+                                continue
+                        
+                        if found_popup:
+                            break
+                            
+                    except:
+                        continue
+                
+                # 如果没有找到更多弹窗，退出循环
+                if not found_popup:
+                    break
+                
+                # 等待一下，看是否有新的弹窗出现
+                time.sleep(1)
+            
+            if closed_count > 0:
+                logger.info(f"✅ 共关闭了 {closed_count} 个弹窗")
+                self.take_screenshot("popups_closed")
+            else:
+                logger.info("✅ 未检测到弹窗")
+            
+            return True
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 关闭弹窗时出错: {e}")
+            return False
     
     def switch_account(self):
         """切换 Google 账号"""
@@ -827,11 +1097,12 @@ class VideoProcessor:
         logger.info("="*60)
         
         try:
-            # 步骤1：获取当前账号
+            # 步骤1：获取当前账号并标记为不可用
             current_account = self.get_current_account()
             if current_account:
                 logger.info(f"📧 当前账号: {current_account}")
-                self.switched_accounts.add(current_account)
+                self.unavailable_accounts.add(current_account)
+                logger.info(f"🚫 标记为不可用: {current_account}")
             else:
                 logger.warning("⚠️ 无法获取当前账号")
             
@@ -915,35 +1186,110 @@ class VideoProcessor:
             # 步骤5：选择下一个可用账号
             logger.info("4️⃣ 选择下一个可用账号...")
             
-            # 查找所有可用账号
+            # 等待账号列表加载
+            time.sleep(2)
+            
+            # 查找所有可用账号 - 使用更精确的选择器
             account_selectors = [
-                'div[data-identifier]',  # Google 账号选择器
+                'div[data-identifier]',  # Google 账号选择器（最常见）
                 'div[role="link"]',
                 'li[data-email]',
+                'div[data-email]',
+                'a[data-identifier]',
             ]
             
             available_accounts = []
+            all_accounts_found = []  # 记录所有找到的账号（用于调试）
+            
             for selector in account_selectors:
                 try:
                     accounts = self.page.locator(selector).all()
+                    logger.debug(f"选择器 {selector} 找到 {len(accounts)} 个元素")
+                    
                     for account in accounts:
                         try:
-                            account_text = account.inner_text()
-                            if '@' in account_text and account_text not in self.switched_accounts:
-                                available_accounts.append((account, account_text))
-                        except:
+                            # 尝试多种方法提取账号信息
+                            account_text = None
+                            
+                            # 方法1: 从 data-identifier 属性提取
+                            try:
+                                identifier = account.get_attribute('data-identifier')
+                                if identifier and '@' in identifier:
+                                    account_text = identifier.strip()
+                            except:
+                                pass
+                            
+                            # 方法2: 从 data-email 属性提取
+                            if not account_text:
+                                try:
+                                    email = account.get_attribute('data-email')
+                                    if email and '@' in email:
+                                        account_text = email.strip()
+                                except:
+                                    pass
+                            
+                            # 方法3: 从 inner_text 提取
+                            if not account_text:
+                                try:
+                                    text = account.inner_text()
+                                    if '@' in text:
+                                        # 提取邮箱部分（可能包含名字）
+                                        import re
+                                        email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', text)
+                                        if email_match:
+                                            account_text = email_match.group()
+                                except:
+                                    pass
+                            
+                            if account_text and '@' in account_text:
+                                all_accounts_found.append(account_text)
+                                # 检查是否不可用
+                                if account_text not in self.unavailable_accounts:
+                                    available_accounts.append((account, account_text))
+                                    logger.debug(f"  ✅ 可用账号: {account_text}")
+                                else:
+                                    logger.debug(f"  🚫 不可用: {account_text}")
+                        except Exception as e:
+                            logger.debug(f"  ⚠️ 提取账号信息失败: {e}")
                             continue
-                except:
+                except Exception as e:
+                    logger.debug(f"选择器 {selector} 查询失败: {e}")
                     continue
+            
+            # 去重账号列表
+            unique_accounts = list(set(all_accounts_found))
+            unique_available = []
+            seen = set()
+            for account, account_text in available_accounts:
+                if account_text not in seen:
+                    unique_available.append((account, account_text))
+                    seen.add(account_text)
+            available_accounts = unique_available
+            
+            # 输出统计信息
+            logger.info(f"📊 找到 {len(unique_accounts)} 个不同账号，其中 {len(available_accounts)} 个可用")
+            if unique_accounts:
+                logger.info(f"📋 所有账号: {', '.join(unique_accounts)}")
+            if self.unavailable_accounts:
+                logger.info(f"🚫 不可用账号: {', '.join(self.unavailable_accounts)}")
+            
+            selected_account_text = None
             
             if not available_accounts:
                 logger.warning("⚠️ 没有找到可用的账号")
-                logger.info("💡 提示: 可能需要手动选择账号")
+                logger.info("💡 提示: 所有账号可能都已使用，或需要手动选择")
                 
                 # 等待用户手动选择
                 logger.info("\n请手动选择一个账号，然后按 Enter 继续...")
                 try:
                     input("👉 选择完成后按 Enter: ")
+                    # 用户手动选择后，尝试获取当前账号
+                    time.sleep(3)
+                    selected_account_text = self.get_current_account()
+                    if selected_account_text:
+                        logger.info(f"📧 检测到选择的账号: {selected_account_text}")
+                        self.switched_accounts.add(selected_account_text)
+                        self.current_account = selected_account_text
                 except KeyboardInterrupt:
                     return False
             else:
@@ -951,12 +1297,17 @@ class VideoProcessor:
                 next_account, next_account_text = available_accounts[0]
                 logger.info(f"📧 选择账号: {next_account_text}")
                 
-                next_account.click()
-                logger.info("✅ 已点击账号")
-                
-                # 记录已切换的账号
-                self.switched_accounts.add(next_account_text)
-                self.current_account = next_account_text
+                try:
+                    next_account.click()
+                    logger.info("✅ 已点击账号")
+                    
+                    # 记录选择的账号
+                    selected_account_text = next_account_text
+                    self.switched_accounts.add(next_account_text)
+                    self.current_account = next_account_text
+                except Exception as e:
+                    logger.error(f"❌ 点击账号失败: {e}")
+                    return False
             
             # 步骤6：等待返回 AI Studio
             logger.info("5️⃣ 等待返回 AI Studio...")
@@ -969,8 +1320,29 @@ class VideoProcessor:
             except:
                 logger.warning("⚠️ 未检测到返回 AI Studio，可能需要手动操作")
             
+            # 等待页面完全加载
             time.sleep(3)
             self.take_screenshot("account_switched")
+            
+            # 验证账号是否切换成功
+            logger.info("6️⃣ 验证账号切换...")
+            new_account = self.get_current_account()
+            if new_account:
+                logger.info(f"✅ 当前账号: {new_account}")
+                # 更新记录
+                if new_account != current_account:
+                    logger.info(f"✅ 账号切换成功: {current_account} → {new_account}")
+                    self.switched_accounts.add(new_account)
+                    self.current_account = new_account
+                else:
+                    logger.warning(f"⚠️ 账号未改变，仍然是: {new_account}")
+            else:
+                logger.warning("⚠️ 无法验证新账号")
+            
+            # 步骤7：等待并关闭弹窗
+            logger.info("7️⃣ 等待并关闭弹窗...")
+            time.sleep(5)  # 等待5秒，让弹窗出现
+            self.close_popups()
             
             logger.info("="*60)
             logger.info("✅ 账号切换完成")
@@ -1022,7 +1394,11 @@ class VideoProcessor:
             return False
     
     def wait_for_response(self, timeout=None, step_number=None):
-        """等待 AI 响应完成 - 通过检测按钮状态，并处理 rate limit"""
+        """等待 AI 响应完成 - 通过检测按钮状态，并处理 rate limit
+        
+        每个步骤都不能跳过，会持续等待直到AI完成。
+        如果超过3次超时，会询问用户是否继续等待。
+        """
         if timeout is None:
             timeout = config.WAIT_FOR_RESPONSE * 6  # 默认 60 秒
 
@@ -1032,8 +1408,12 @@ class VideoProcessor:
         start_time = time.time()
         check_interval = 2
         last_status_log = 0
+        timeout_count = 0  # 超时次数计数
+        max_timeout_count = 3  # 最多3次超时后询问用户
 
-        while time.time() - start_time < timeout:
+        while True:  # 改为无限循环，直到AI完成
+            elapsed = time.time() - start_time
+            
             # 检查是否达到速率限制
             if self.check_rate_limit():
                 logger.warning("⚠️ 检测到速率限制，尝试切换账号...")
@@ -1041,11 +1421,9 @@ class VideoProcessor:
                 # 尝试切换账号
                 if self.switch_account():
                     logger.info("✅ 账号切换成功，重新发送请求")
-                    # 返回特殊标记，让调用者知道需要重新发送
                     return "rate_limit_switched"
                 else:
                     logger.error("❌ 账号切换失败")
-                    # 询问用户如何处理
                     logger.info("\n可选操作:")
                     logger.info("  1. 输入 'retry' - 重试切换账号")
                     logger.info("  2. 输入 'manual' - 手动切换后继续")
@@ -1071,11 +1449,13 @@ class VideoProcessor:
                 
                 # 重置计时器
                 start_time = time.time()
+                timeout_count = 0
                 continue
             
             # 检查是否被阻止
             if self.check_content_blocked():
                 start_time = time.time()  # 重置计时器
+                timeout_count = 0
                 continue
 
             # 检查 AI 是否正在运行
@@ -1083,50 +1463,245 @@ class VideoProcessor:
                 # AI 正在运行，继续等待
                 current_time = time.time()
                 if current_time - last_status_log > 10:  # 每 10 秒输出一次状态
-                    elapsed = int(current_time - start_time)
-                    logger.info(f"⏳ AI 正在处理... (已等待 {elapsed} 秒)")
+                    elapsed_int = int(current_time - start_time)
+                    logger.info(f"⏳ AI 正在处理... (已等待 {elapsed_int} 秒)")
                     last_status_log = current_time
+                
+                # 检查是否超时
+                if elapsed > timeout:
+                    timeout_count += 1
+                    logger.warning(f"⚠️ 等待超时（第 {timeout_count} 次），但 AI 仍在运行")
+                    
+                    # 如果超过最大超时次数，询问用户
+                    if timeout_count >= max_timeout_count:
+                        logger.warning(f"⚠️ 已超时 {timeout_count} 次（{int(elapsed)} 秒）")
+                        logger.info("\n" + "="*60)
+                        logger.info(f"⚠️ AI 仍在处理{step_info}，已等待 {int(elapsed)} 秒")
+                        logger.info("="*60)
+                        logger.info("可选操作:")
+                        logger.info("  1. 直接按 Enter - 继续等待")
+                        logger.info("  2. 输入 'skip' - 跳过当前步骤（不推荐）")
+                        logger.info("  3. 输入 'quit' - 退出程序")
+                        
+                        try:
+                            user_input = input("\n👉 请输入操作（Enter继续等待）: ").strip().lower()
+                            
+                            if not user_input:
+                                # 继续等待
+                                logger.info("✅ 继续等待 AI 完成...")
+                                start_time = time.time()  # 重置计时器
+                                timeout_count = 0
+                            elif user_input == 'skip':
+                                logger.warning("⚠️ 用户选择跳过当前步骤")
+                                return "skip"
+                            elif user_input == 'quit':
+                                logger.info("👋 用户选择退出")
+                                return "quit"
+                        except KeyboardInterrupt:
+                            return "quit"
+                    else:
+                        # 还没到最大次数，自动继续等待
+                        logger.info(f"💡 继续等待 AI 完成... (将在第 {max_timeout_count} 次超时后询问)")
+                        start_time = time.time()  # 重置计时器
                 
                 time.sleep(check_interval)
                 continue
             else:
                 # AI 已完成，等待响应稳定
                 logger.info("✅ AI 处理完成，等待响应稳定...")
-                time.sleep(3)
+                
+                # 步骤25需要更长时间渲染表格
+                if step_number == 25:
+                    logger.info("📊 步骤25：等待表格渲染（5秒）...")
+                    time.sleep(5)
+                else:
+                    time.sleep(3)
                 break
 
             # 如果等待时间过长，截图记录
-            if time.time() - start_time > timeout / 2:
+            if elapsed > timeout / 2 and elapsed % 30 < check_interval:
                 self.take_screenshot(
                     f"waiting_response_step_{step_number}"
                     if step_number
                     else "waiting_response"
                 )
 
-        # 最终检查
-        if self.is_ai_running():
-            logger.warning("⚠️ AI 仍在运行，但已达到超时时间")
-        else:
-            logger.info("✅ AI 响应完成")
-
+        # AI 已完成
+        logger.info(f"✅ AI 响应完成（总等待时间: {int(time.time() - start_time)} 秒）")
         self.take_screenshot(
             f"response_received_step_{step_number}"
             if step_number
             else "response_received"
         )
 
-    def extract_response(self):
+    def extract_response(self, step_number=None):
         """提取 AI 的响应内容"""
         try:
-            # 获取最后的响应内容（需要根据实际页面调整选择器）
-            responses = self.page.locator('[data-message-author-role="model"]').all()
+            # 获取最后的响应内容（使用正确的选择器）
+            responses = self.page.locator('[data-turn-role="Model"]').all()
+            logger.info(f"🔍 找到 {len(responses)} 个AI响应")
+            
             if responses:
-                last_response = responses[-1].inner_text()
+                # 选择最后一个非空的响应
+                last_response_element = None
+                for i in range(len(responses) - 1, -1, -1):
+                    try:
+                        text = responses[i].inner_text()
+                        if text and len(text.strip()) > 0:
+                            last_response_element = responses[i]
+                            logger.info(f"📍 使用响应（索引 {i}），长度: {len(text)} 字符")
+                            break
+                    except:
+                        continue
+                
+                if not last_response_element:
+                    logger.warning("⚠️ 所有响应元素都为空")
+                    last_response_element = responses[-1]
+                    logger.info(f"📍 使用最后一个响应（索引 {len(responses)-1}）")
+                
+                # 检查响应是否为空，如果为空则等待一下
+                try:
+                    response_text = last_response_element.inner_text()
+                    if not response_text or len(response_text.strip()) == 0:
+                        logger.warning("⚠️ 响应元素为空，等待3秒后重试...")
+                        time.sleep(3)
+                        response_text = last_response_element.inner_text()
+                        if not response_text or len(response_text.strip()) == 0:
+                            logger.warning("⚠️ 响应仍然为空")
+                            
+                            # 调试：检查所有响应元素
+                            logger.info("🔍 检查所有响应元素...")
+                            for i, resp in enumerate(responses[-5:]):  # 检查最后5个
+                                try:
+                                    text = resp.inner_text()
+                                    logger.info(f"  响应 {len(responses)-5+i}: {len(text)} 字符")
+                                    if text:
+                                        logger.info(f"    预览: {text[:100]}...")
+                                except Exception as e:
+                                    logger.warning(f"  响应 {len(responses)-5+i}: 无法读取 - {e}")
+                            
+                            # 尝试使用倒数第二个响应
+                            if len(responses) >= 2:
+                                logger.info("💡 尝试使用倒数第二个响应...")
+                                last_response_element = responses[-2]
+                                response_text = last_response_element.inner_text()
+                                logger.info(f"📝 倒数第二个响应长度: {len(response_text)} 字符")
+                except Exception as e:
+                    logger.warning(f"⚠️ 检查响应文本失败: {e}")
+                
+                # 如果是步骤25，尝试直接从HTML DOM提取表格数据
+                if step_number == 25:
+                    logger.info("📊 步骤25：尝试从HTML DOM提取表格数据...")
+                    
+                    # 等待表格出现（最多等待10秒）
+                    try:
+                        logger.info("⏳ 等待表格元素出现...")
+                        last_response_element.locator('table').first.wait_for(state='visible', timeout=10000)
+                        logger.info("✅ 表格元素已出现")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 等待表格超时: {e}")
+                    
+                    table_data = self.extract_table_from_dom(last_response_element)
+                    if table_data:
+                        logger.info(f"✅ 从DOM提取到 {len(table_data)} 行表格数据")
+                        return table_data
+                    else:
+                        logger.warning("⚠️ 从DOM提取表格失败，回退到文本提取")
+                
+                # 默认：提取文本内容
+                last_response = last_response_element.inner_text()
+                logger.info(f"📝 提取响应文本，长度: {len(last_response)} 字符")
+                if last_response:
+                    logger.debug(f"响应内容预览: {last_response[:200]}...")
+                else:
+                    logger.warning("⚠️ 响应文本为空")
                 return last_response
-            return ""
+            else:
+                logger.warning("⚠️ 未找到任何AI响应元素")
+                return ""
         except Exception as e:
             logger.error(f"❌ 提取响应失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return ""
+    
+    def extract_table_from_dom(self, response_element):
+        """从HTML DOM中直接提取表格数据"""
+        try:
+            # 查找表格元素
+            tables = response_element.locator('table').all()
+            if not tables:
+                logger.warning("⚠️ 未找到表格元素")
+                return None
+            
+            # 使用最后一个表格（通常是最新的）
+            table = tables[-1]
+            logger.info(f"📋 找到 {len(tables)} 个表格，使用最后一个")
+            
+            # 提取表头
+            headers = []
+            header_rows = table.locator('tr.table-header').all()
+            if header_rows:
+                header_row = header_rows[0]
+                header_cells = header_row.locator('td').all()
+                for cell in header_cells:
+                    try:
+                        text = cell.inner_text().strip()
+                        headers.append(text)
+                    except:
+                        headers.append("")
+                logger.info(f"📋 表头: {headers}")
+            else:
+                logger.warning("⚠️ 未找到表头")
+                return None
+            
+            # 提取数据行
+            table_data = []
+            data_rows = table.locator('tr:not(.table-header)').all()
+            logger.info(f"📊 找到 {len(data_rows)} 行数据")
+            
+            for row_index, row in enumerate(data_rows):
+                try:
+                    cells = row.locator('td').all()
+                    row_dict = {}
+                    
+                    for col_index, cell in enumerate(cells):
+                        try:
+                            text = cell.inner_text().strip()
+                            if col_index < len(headers):
+                                header = headers[col_index]
+                                row_dict[header] = text if text else ""
+                            else:
+                                row_dict[f"column_{col_index}"] = text if text else ""
+                        except Exception as e:
+                            logger.debug(f"提取单元格 [{row_index},{col_index}] 失败: {e}")
+                            if col_index < len(headers):
+                                row_dict[headers[col_index]] = ""
+                    
+                    if row_dict:
+                        table_data.append(row_dict)
+                        logger.debug(f"行 {row_index + 1}: {row_dict}")
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ 提取第 {row_index + 1} 行失败: {e}")
+                    continue
+            
+            if table_data:
+                logger.info(f"✅ 成功提取 {len(table_data)} 行数据")
+                # 显示每列的统计
+                for header in headers:
+                    non_empty = sum(1 for row in table_data if row.get(header, ""))
+                    logger.info(f"  - {header}: {non_empty}/{len(table_data)} 行有数据")
+                return table_data
+            else:
+                logger.warning("⚠️ 未提取到任何数据")
+                return None
+            
+        except Exception as e:
+            logger.error(f"❌ 从DOM提取表格失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
     
     def parse_table_response(self, response_text):
         """解析 AI 响应中的表格数据
@@ -1220,6 +1795,75 @@ class VideoProcessor:
             logger.debug(traceback.format_exc())
             return None
 
+    def extract_and_save_srt_files(self, text_content, output_folder):
+        """从文本中提取并保存SRT文件
+        
+        Args:
+            text_content: 包含SRT内容的文本
+            output_folder: 输出文件夹
+            
+        Returns:
+            保存的SRT文件列表
+        """
+        import re
+        
+        srt_files = []
+        
+        try:
+            # 方法1：查找明确标记的SRT文件（如 "文件1:" 或 "File 1:"）
+            # 分割文本，查找多个SRT块
+            srt_pattern = r'(?:文件|File|SRT)\s*(\d+)[：:](.*?)(?=(?:文件|File|SRT)\s*\d+[：:]|$)'
+            matches = re.findall(srt_pattern, text_content, re.DOTALL | re.IGNORECASE)
+            
+            if matches:
+                logger.info(f"📋 找到 {len(matches)} 个标记的SRT文件")
+                for i, (file_num, srt_content) in enumerate(matches, 1):
+                    srt_file = output_folder / f"step_23_output_{file_num}.srt"
+                    with open(srt_file, "w", encoding="utf-8") as f:
+                        f.write(srt_content.strip())
+                    srt_files.append(srt_file)
+                    logger.info(f"✅ 保存SRT文件 {file_num}: {srt_file.name} ({len(srt_content)} 字符)")
+            else:
+                # 方法2：查找SRT格式的内容块（通过时间戳识别）
+                # SRT格式：序号 + 时间戳 + 文本
+                srt_block_pattern = r'(\d+\s+\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}.*?)(?=\n\d+\s+\d{2}:\d{2}:\d{2},\d{3}\s+-->|\Z)'
+                
+                # 尝试分割成多个SRT文件（通过连续的空行或特定标记）
+                # 简单方法：如果文本很长，可能包含多个SRT文件，尝试按长度分割
+                if '00:00:00,000' in text_content or '00:00:00,0' in text_content:
+                    # 包含SRT时间戳，尝试保存
+                    # 检查是否有多个SRT文件（通过查找多个起始时间戳）
+                    start_timestamps = re.findall(r'^1\s+00:00:00', text_content, re.MULTILINE)
+                    
+                    if len(start_timestamps) > 1:
+                        # 多个SRT文件，尝试分割
+                        logger.info(f"📋 检测到 {len(start_timestamps)} 个SRT文件起始标记")
+                        parts = re.split(r'(?=^1\s+00:00:00)', text_content, flags=re.MULTILINE)
+                        parts = [p.strip() for p in parts if p.strip()]
+                        
+                        for i, part in enumerate(parts, 1):
+                            if part:
+                                srt_file = output_folder / f"step_23_output_{i}.srt"
+                                with open(srt_file, "w", encoding="utf-8") as f:
+                                    f.write(part)
+                                srt_files.append(srt_file)
+                                logger.info(f"✅ 保存SRT文件 {i}: {srt_file.name} ({len(part)} 字符)")
+                    else:
+                        # 单个SRT文件
+                        srt_file = output_folder / "step_23_output_1.srt"
+                        with open(srt_file, "w", encoding="utf-8") as f:
+                            f.write(text_content.strip())
+                        srt_files.append(srt_file)
+                        logger.info(f"✅ 保存SRT文件: {srt_file.name} ({len(text_content)} 字符)")
+            
+            return srt_files
+            
+        except Exception as e:
+            logger.error(f"❌ 提取SRT文件失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
+    
     def save_output_data(self, video_name, step_outputs):
         """保存输出数据为 Excel"""
         output_folder = self.process_folder / video_name.replace(".mp4", "").replace(
@@ -1228,16 +1872,46 @@ class VideoProcessor:
         output_folder.mkdir(exist_ok=True)
 
         logger.info(f"💾 保存输出数据到: {output_folder}")
+        logger.info(f"📊 待保存的步骤: {list(step_outputs.keys())}")
 
         for step_num, data in step_outputs.items():
+            logger.info(f"🔍 处理步骤 {step_num}, 数据类型: {type(data)}, 数据长度: {len(data) if data else 0}")
+            
             if not data:
+                logger.warning(f"⚠️ 步骤 {step_num} 数据为空，跳过")
                 continue
+
+            # 步骤23特殊处理：保存为SRT文件
+            if step_num == 23 and isinstance(data, str):
+                try:
+                    srt_files = self.extract_and_save_srt_files(data, output_folder)
+                    if srt_files:
+                        logger.info(f"✅ 步骤 23 保存了 {len(srt_files)} 个SRT文件")
+                        for srt_file in srt_files:
+                            logger.info(f"  - {srt_file.name}")
+                    else:
+                        logger.warning("⚠️ 步骤 23 未找到SRT文件内容，保存为文本")
+                        # 回退到保存为文本文件
+                        text_file = output_folder / f"step_{step_num}_output.txt"
+                        with open(text_file, "w", encoding="utf-8") as f:
+                            f.write(data)
+                        logger.info(f"✅ 已保存为文本文件: {text_file.name}")
+                    continue
+                except Exception as e:
+                    logger.error(f"❌ 保存步骤 23 SRT文件失败: {e}")
+                    # 继续使用默认的保存逻辑
 
             output_file = output_folder / f"step_{step_num}_output.xlsx"
 
             try:
+                # 如果是列表（从DOM直接提取的表格数据）
+                if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                    df = pd.DataFrame(data)
+                    logger.info(f"📊 步骤 {step_num} 数据: {len(df)} 行 x {len(df.columns)} 列")
+                    logger.info(f"📋 列名: {', '.join(df.columns.tolist())}")
+                    
                 # 如果是字符串，尝试解析为表格数据
-                if isinstance(data, str):
+                elif isinstance(data, str):
                     # 尝试解析表格数据
                     parsed_data = self.parse_table_response(data)
                     
@@ -1245,8 +1919,6 @@ class VideoProcessor:
                         # 成功解析为结构化数据
                         df = pd.DataFrame(parsed_data)
                         logger.info(f"📊 步骤 {step_num} 解析到 {len(df)} 行 x {len(df.columns)} 列数据")
-                        
-                        # 显示列名
                         logger.info(f"📋 列名: {', '.join(df.columns.tolist())}")
                     else:
                         # 无法解析，保存为单列文本
@@ -1255,13 +1927,18 @@ class VideoProcessor:
                         
                 elif isinstance(data, dict):
                     df = pd.DataFrame([data])
-                elif isinstance(data, list):
-                    df = pd.DataFrame(data)
                 else:
                     df = pd.DataFrame([{"数据": str(data)}])
 
+                # 写入Excel文件
                 df.to_excel(output_file, index=False)
-                logger.info(f"✅ 保存步骤 {step_num} 数据: {output_file.name}")
+                
+                # 验证文件是否真的被创建
+                if output_file.exists():
+                    file_size = output_file.stat().st_size
+                    logger.info(f"✅ 保存步骤 {step_num} 数据: {output_file.name} ({file_size} 字节)")
+                else:
+                    logger.error(f"❌ 文件未创建: {output_file.name}")
 
             except Exception as e:
                 logger.error(f"❌ 保存步骤 {step_num} 数据失败: {e}")
@@ -1348,7 +2025,7 @@ class VideoProcessor:
             # 1. 更新提示词文件
             if start_step <= 1:
                 try:
-                    if not self.update_prompts_file(video_name, duration):
+                    if not self.update_prompts_file(video_info):
                         action, step = self.wait_for_user_action("更新提示词文件失败", 1)
                         if action == "quit":
                             return False
@@ -1379,28 +2056,28 @@ class VideoProcessor:
 
             logger.info(f"共有 {len(prompts)} 个提示词需要处理")
 
-            # 3. 打开 AI Studio（如果需要）
+            # 3. 上传视频（如果需要）
             if start_step <= 1:
                 try:
-                    if not self.open_ai_studio():
-                        action, step = self.wait_for_user_action("打开 AI Studio 失败", 1)
-                        if action == "quit":
-                            return False
-                        elif action == "skip":
-                            return False
-                        elif action == "retry":
-                            return self.process_single_video(video_info, start_step=1)
-                except Exception as e:
-                    action, step = self.wait_for_user_action(f"打开 AI Studio 异常: {e}", 1)
-                    if action == "quit":
-                        return False
-                    elif action == "skip":
-                        return False
-
-            # 4. 上传视频（如果需要）
-            if start_step <= 1:
-                try:
-                    if not self.upload_video(video_path):
+                    upload_result = self.upload_video(video_path)
+                    
+                    # 检查是否需要刷新页面（上传后出现弹窗）
+                    if upload_result == "popup_closed_need_refresh":
+                        logger.warning("⚠️ 上传后出现弹窗，已关闭")
+                        logger.info("🔄 刷新页面并重新开始步骤1...")
+                        
+                        # 刷新页面
+                        try:
+                            self.page.reload(wait_until="networkidle", timeout=60000)
+                            logger.info("✅ 页面已刷新")
+                            time.sleep(3)
+                        except Exception as e:
+                            logger.error(f"❌ 刷新页面失败: {e}")
+                        
+                        # 重新开始步骤1
+                        return self.process_single_video(video_info, start_step=1)
+                    
+                    elif not upload_result:
                         action, step = self.wait_for_user_action("上传视频失败", 1)
                         if action == "quit":
                             return False
@@ -1417,10 +2094,29 @@ class VideoProcessor:
                     elif action == "skip":
                         return False
 
-            # 5. 发送第一个提示词并运行
+            # 4. 发送第一个提示词并运行
             if start_step <= 1 and prompts:
                 try:
-                    if not self.send_prompt(prompts[0], step_number=1):
+                    send_result = self.send_prompt(prompts[0], step_number=1)
+                    
+                    # 检查是否是上传失败
+                    if send_result == "upload_failed":
+                        logger.error("❌ 检测到视频上传失败（Run按钮超时不可用）")
+                        logger.info("🔄 尝试恢复：刷新页面并重新开始")
+                        
+                        # 刷新页面
+                        try:
+                            self.page.reload(wait_until="networkidle", timeout=60000)
+                            logger.info("✅ 页面已刷新")
+                            time.sleep(3)
+                        except Exception as e:
+                            logger.error(f"❌ 刷新页面失败: {e}")
+                        
+                        # 重新开始步骤1
+                        logger.info("🔄 重新开始步骤1...")
+                        return self.process_single_video(video_info, start_step=1)
+                    
+                    elif not send_result:
                         action, step = self.wait_for_user_action("发送步骤1失败", 1)
                         if action == "quit":
                             return False
@@ -1436,7 +2132,9 @@ class VideoProcessor:
                     
                     # 处理 rate limit 切换账号的情况
                     if response_result == "rate_limit_switched":
-                        logger.info("🔄 账号已切换，重新发送步骤1")
+                        logger.info("🔄 账号已切换，会话已丢失")
+                        logger.info("📤 需要重新上传视频并从步骤1开始")
+                        # 从头开始（start_step=1 会重新上传视频）
                         return self.process_single_video(video_info, start_step=1)
                     elif response_result == "skip":
                         logger.info("⏭️ 跳过当前视频")
@@ -1453,7 +2151,7 @@ class VideoProcessor:
                     elif action == "retry":
                         return self.process_single_video(video_info, start_step=1)
 
-            # 6. 逐步发送剩余提示词（步骤2-25）
+            # 5. 逐步发送剩余提示词（步骤2-25）
             step_outputs = {}
 
             for i, prompt in enumerate(prompts[1:], start=2):
@@ -1484,8 +2182,11 @@ class VideoProcessor:
                     
                     # 处理 rate limit 切换账号的情况
                     if response_result == "rate_limit_switched":
-                        logger.info("🔄 账号已切换，重新发送当前步骤")
-                        return self.process_single_video(video_info, start_step=i)
+                        logger.info("🔄 账号已切换，会话已丢失")
+                        logger.info("📤 需要重新上传视频并从步骤1开始")
+                        logger.info(f"💡 当前在步骤 {i}，切换后将从步骤1重新开始")
+                        # 从头开始（start_step=1 会重新上传视频）
+                        return self.process_single_video(video_info, start_step=1)
                     elif response_result == "skip":
                         logger.info("⏭️ 跳过当前视频")
                         return False
@@ -1495,9 +2196,12 @@ class VideoProcessor:
 
                     # 保存特定步骤的输出
                     if i in config.SAVE_STEPS:
-                        response = self.extract_response()
+                        response = self.extract_response(step_number=i)
                         step_outputs[i] = response
                         logger.info(f"💾 已捕获步骤 {i} 的输出")
+                        logger.info(f"📊 步骤 {i} 数据类型: {type(response)}, 数据量: {len(response) if response else 0}")
+                        if isinstance(response, list) and response:
+                            logger.info(f"📋 步骤 {i} 第一条数据: {response[0]}")
                         self.take_screenshot(f"step_{i}_output")
                         
                 except Exception as e:
@@ -1513,7 +2217,7 @@ class VideoProcessor:
                     elif action == "continue":
                         continue
 
-            # 7. 保存输出数据
+            # 6. 保存输出数据
             try:
                 self.save_output_data(video_name, step_outputs)
             except Exception as e:
@@ -1637,10 +2341,22 @@ class VideoProcessor:
             logger.error("❌ 没有找到待处理的视频")
             return False
 
+        # 2. 首次打开 AI Studio 并等待用户确认（仅首次）
+        if not self.ai_studio_opened:
+            logger.info("\n" + "="*60)
+            logger.info("📋 步骤 1: 准备工作")
+            logger.info("="*60)
+            logger.info(f"✅ 已加载 {len(videos)} 个视频")
+            logger.info("")
+            
+            if not self.open_ai_studio():
+                logger.error("❌ 打开 AI Studio 失败")
+                return False
+        
         success_count = 0
         failed_videos = []
 
-        # 2. 处理每个视频
+        # 3. 处理每个视频
         for i, video_info in enumerate(videos, start=1):
             logger.info(f"\n{'#'*60}")
             logger.info(f"# 进度: {i}/{len(videos)}")
@@ -1664,7 +2380,7 @@ class VideoProcessor:
                 logger.info(f"\n⏸️ 休息 {config.WAIT_BETWEEN_VIDEOS} 秒...")
                 time.sleep(config.WAIT_BETWEEN_VIDEOS)
 
-        # 3. 合并所有 Excel 文件
+        # 4. 合并所有 Excel 文件
         logger.info("\n" + "=" * 60)
         logger.info("开始合并数据...")
         logger.info("=" * 60)
@@ -1673,7 +2389,7 @@ class VideoProcessor:
         except Exception as e:
             logger.error(f"❌ 合并数据失败: {e}")
 
-        # 4. 运行最终处理
+        # 5. 运行最终处理
         logger.info("\n" + "=" * 60)
         logger.info("运行最终处理...")
         logger.info("=" * 60)
@@ -1682,7 +2398,7 @@ class VideoProcessor:
         except Exception as e:
             logger.error(f"❌ 最终处理失败: {e}")
 
-        # 5. 输出统计信息
+        # 6. 输出统计信息
         logger.info("\n" + "=" * 60)
         logger.info("🎉 本批次任务完成！")
         logger.info("=" * 60)

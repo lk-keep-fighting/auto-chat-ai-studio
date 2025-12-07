@@ -26,7 +26,11 @@ files/
 # Playwright
 playwright-report/
 test-results/
-
+test_output/
+assets
+screenshots/
+assets/
+assets1/
 # IDE
 .vscode/
 .idea/
