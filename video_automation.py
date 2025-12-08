@@ -743,7 +743,12 @@ class VideoProcessor:
             return False
 
     def send_prompt(self, prompt_text, step_number=None):
-        """发送提示词到对话框"""
+        """发送提示词到对话框
+        
+        流程：
+        1. 填入提示词 → Run按钮变为可用
+        2. 点击Run → 按钮变为Stop（AI开始处理）
+        """
         step_info = f"步骤 {step_number}" if step_number else "提示词"
         logger.info(f"📝 发送{step_info}: {prompt_text[:50]}...")
 
@@ -1359,7 +1364,13 @@ class VideoProcessor:
             return False
 
     def is_ai_running(self):
-        """检查 AI 是否正在运行（通过按钮状态判断）"""
+        """检查 AI 是否正在运行
+        
+        正确的判断逻辑：
+        - AI运行中：Run按钮显示"Stop"
+        - AI完成：Run按钮显示"Run"且不可用（aria-disabled="true"）
+        - 可以发送：Run按钮显示"Run"且可用（填入提示词后）
+        """
         try:
             # 查找 Run 按钮
             run_button_selectors = [
@@ -1372,25 +1383,97 @@ class VideoProcessor:
                 try:
                     run_button = self.page.locator(selector).first
                     if run_button.count() > 0:
-                        # 检查按钮是否包含 "Stop" 文本或 stoppable 类
+                        # 检查按钮内容和属性
                         button_html = run_button.inner_html()
                         button_class = run_button.get_attribute('class') or ''
+                        aria_disabled = run_button.get_attribute('aria-disabled')
                         
                         # 如果按钮显示 "Stop" 或包含 stoppable 类，说明 AI 正在运行
                         if 'Stop' in button_html or 'stoppable' in button_class:
+                            logger.debug("🔍 AI运行中: 按钮显示Stop")
                             return True
                         
-                        # 如果按钮显示 "Run"，说明 AI 已完成
-                        if 'Run' in button_html and 'Stop' not in button_html:
+                        # 如果按钮显示 "Run" 且不可用，说明 AI 已完成（输入框为空）
+                        if 'Run' in button_html and aria_disabled == 'true':
+                            logger.debug("🔍 AI已完成: 按钮显示Run且不可用")
+                            return False
+                        
+                        # 如果按钮显示 "Run" 且可用，说明已填入提示词，可以发送
+                        if 'Run' in button_html and aria_disabled != 'true':
+                            logger.debug("🔍 可以发送: 按钮显示Run且可用")
                             return False
                 except:
                     continue
             
+            # 方法2：检查是否有加载指示器
+            loading_selectors = [
+                '[role="progressbar"]',
+                '.loading',
+                '.spinner',
+                'text="Generating"',
+                'text="生成中"',
+            ]
+            
+            for selector in loading_selectors:
+                try:
+                    indicator = self.page.locator(selector).first
+                    if indicator.count() > 0 and indicator.is_visible(timeout=500):
+                        logger.debug(f"🔍 AI运行中: 发现加载指示器 {selector}")
+                        return True
+                except:
+                    continue
+            
             # 默认返回 False（假设已完成）
+            logger.debug("🔍 AI已完成: 所有检查通过")
             return False
             
         except Exception as e:
             logger.debug(f"检查 AI 运行状态时出错: {e}")
+            return False
+    
+    def verify_response_complete(self, step_number=None):
+        """验证响应是否完整"""
+        try:
+            # 检查是否有响应
+            responses = self.page.locator('[data-turn-role="Model"]').all()
+            if not responses:
+                logger.debug("⚠️ 未找到任何响应")
+                return False
+            
+            # 检查最后一个响应是否有内容
+            last_response = responses[-1]
+            text = last_response.inner_text()
+            
+            if not text or len(text.strip()) == 0:
+                logger.debug("⚠️ 最后一个响应为空")
+                return False
+            
+            # 检查响应长度是否合理（至少10个字符）
+            if len(text.strip()) < 10:
+                logger.debug(f"⚠️ 响应太短: {len(text)} 字符")
+                return False
+            
+            # 如果是步骤25，检查是否有表格
+            if step_number == 25:
+                tables = last_response.locator('table').all()
+                if not tables:
+                    logger.debug("⚠️ 步骤25未找到表格")
+                    return False
+                
+                # 检查表格是否有数据
+                table = tables[-1]
+                rows = table.locator('tr').count()
+                if rows < 2:  # 至少有表头 + 1行数据
+                    logger.debug(f"⚠️ 表格数据不足: {rows} 行")
+                    return False
+                
+                logger.debug(f"✅ 步骤25表格验证通过: {rows} 行")
+            
+            logger.debug(f"✅ 响应验证通过: {len(text)} 字符")
+            return True
+            
+        except Exception as e:
+            logger.debug(f"⚠️ 验证响应时出错: {e}")
             return False
     
     def wait_for_response(self, timeout=None, step_number=None):
@@ -1507,15 +1590,17 @@ class VideoProcessor:
                 time.sleep(check_interval)
                 continue
             else:
-                # AI 已完成，等待响应稳定
+                # AI 已完成（Run按钮不可用），等待响应稳定
                 logger.info("✅ AI 处理完成，等待响应稳定...")
                 
                 # 步骤25需要更长时间渲染表格
                 if step_number == 25:
-                    logger.info("📊 步骤25：等待表格渲染（5秒）...")
-                    time.sleep(5)
+                    logger.info("📊 步骤25：等待表格渲染（10秒）...")
+                    time.sleep(10)
                 else:
-                    time.sleep(3)
+                    time.sleep(5)
+                
+                logger.info("✅ 响应已稳定，可以提取数据")
                 break
 
             # 如果等待时间过长，截图记录
@@ -1638,27 +1723,66 @@ class VideoProcessor:
             table = tables[-1]
             logger.info(f"📋 找到 {len(tables)} 个表格，使用最后一个")
             
-            # 提取表头
+            # 提取表头 - 尝试多种方法
             headers = []
-            header_rows = table.locator('tr.table-header').all()
-            if header_rows:
-                header_row = header_rows[0]
-                header_cells = header_row.locator('td').all()
-                for cell in header_cells:
-                    try:
-                        text = cell.inner_text().strip()
-                        headers.append(text)
-                    except:
-                        headers.append("")
-                logger.info(f"📋 表头: {headers}")
-            else:
+            
+            # 方法1：查找 thead > tr > th
+            try:
+                thead_rows = table.locator('thead tr').all()
+                if thead_rows:
+                    header_cells = thead_rows[0].locator('th').all()
+                    if not header_cells:
+                        header_cells = thead_rows[0].locator('td').all()
+                    for cell in header_cells:
+                        try:
+                            text = cell.inner_text().strip()
+                            headers.append(text)
+                        except:
+                            headers.append("")
+                    if headers:
+                        logger.info(f"📋 表头（从thead提取）: {headers}")
+            except:
+                pass
+            
+            # 方法2：查找第一行（如果没有thead）
+            if not headers:
+                try:
+                    all_rows = table.locator('tr').all()
+                    if all_rows:
+                        first_row = all_rows[0]
+                        header_cells = first_row.locator('th').all()
+                        if not header_cells:
+                            header_cells = first_row.locator('td').all()
+                        for cell in header_cells:
+                            try:
+                                text = cell.inner_text().strip()
+                                headers.append(text)
+                            except:
+                                headers.append("")
+                        if headers:
+                            logger.info(f"📋 表头（从第一行提取）: {headers}")
+                except:
+                    pass
+            
+            if not headers:
                 logger.warning("⚠️ 未找到表头")
                 return None
             
-            # 提取数据行
+            # 提取数据行（跳过表头行）
             table_data = []
-            data_rows = table.locator('tr:not(.table-header)').all()
-            logger.info(f"📊 找到 {len(data_rows)} 行数据")
+            all_rows = table.locator('tr').all()
+            
+            # 确定从哪一行开始提取数据
+            start_row = 1 if all_rows else 0  # 跳过第一行（表头）
+            
+            # 如果有tbody，从tbody中提取
+            tbody_rows = table.locator('tbody tr').all()
+            if tbody_rows:
+                data_rows = tbody_rows
+                logger.info(f"📊 从tbody找到 {len(data_rows)} 行数据")
+            else:
+                data_rows = all_rows[start_row:] if len(all_rows) > start_row else []
+                logger.info(f"📊 找到 {len(data_rows)} 行数据（跳过表头）")
             
             for row_index, row in enumerate(data_rows):
                 try:
@@ -2153,6 +2277,13 @@ class VideoProcessor:
 
             # 5. 逐步发送剩余提示词（步骤2-25）
             step_outputs = {}
+            
+            # 先提取步骤1的数据（如果需要）
+            if 1 in config.SAVE_STEPS and start_step <= 1:
+                response = self.extract_response(step_number=1)
+                step_outputs[1] = response
+                logger.info(f"💾 已捕获步骤 1 的输出")
+                logger.info(f"📊 步骤 1 数据类型: {type(response)}, 数据量: {len(response) if response else 0}")
 
             for i, prompt in enumerate(prompts[1:], start=2):
                 # 如果指定了起始步骤，跳过之前的步骤
@@ -2164,6 +2295,19 @@ class VideoProcessor:
                 logger.info(f"{'─'*40}")
 
                 try:
+                    # 先提取上一个步骤的数据（在发送新提示词之前）
+                    prev_step = i - 1
+                    if prev_step in config.SAVE_STEPS and prev_step not in step_outputs:
+                        logger.info(f"📊 提取步骤 {prev_step} 的数据...")
+                        response = self.extract_response(step_number=prev_step)
+                        step_outputs[prev_step] = response
+                        logger.info(f"💾 已捕获步骤 {prev_step} 的输出")
+                        logger.info(f"📊 步骤 {prev_step} 数据类型: {type(response)}, 数据量: {len(response) if response else 0}")
+                        if isinstance(response, list) and response:
+                            logger.info(f"📋 步骤 {prev_step} 第一条数据: {response[0]}")
+                        self.take_screenshot(f"step_{prev_step}_output")
+                    
+                    # 发送当前步骤的提示词
                     if not self.send_prompt(prompt, step_number=i):
                         action, step = self.wait_for_user_action(f"步骤 {i} 发送失败", i)
                         if action == "quit":
@@ -2194,16 +2338,6 @@ class VideoProcessor:
                         logger.info("👋 退出程序")
                         return False
 
-                    # 保存特定步骤的输出
-                    if i in config.SAVE_STEPS:
-                        response = self.extract_response(step_number=i)
-                        step_outputs[i] = response
-                        logger.info(f"💾 已捕获步骤 {i} 的输出")
-                        logger.info(f"📊 步骤 {i} 数据类型: {type(response)}, 数据量: {len(response) if response else 0}")
-                        if isinstance(response, list) and response:
-                            logger.info(f"📋 步骤 {i} 第一条数据: {response[0]}")
-                        self.take_screenshot(f"step_{i}_output")
-                        
                 except Exception as e:
                     action, step = self.wait_for_user_action(f"步骤 {i} 异常: {e}", i)
                     if action == "quit":
@@ -2216,6 +2350,18 @@ class VideoProcessor:
                         return self.process_single_video(video_info, start_step=step)
                     elif action == "continue":
                         continue
+            
+            # 提取最后一个步骤的数据（步骤25）
+            last_step = len(prompts)
+            if last_step in config.SAVE_STEPS and last_step not in step_outputs:
+                logger.info(f"📊 提取步骤 {last_step} 的数据...")
+                response = self.extract_response(step_number=last_step)
+                step_outputs[last_step] = response
+                logger.info(f"💾 已捕获步骤 {last_step} 的输出")
+                logger.info(f"📊 步骤 {last_step} 数据类型: {type(response)}, 数据量: {len(response) if response else 0}")
+                if isinstance(response, list) and response:
+                    logger.info(f"📋 步骤 {last_step} 第一条数据: {response[0]}")
+                self.take_screenshot(f"step_{last_step}_output")
 
             # 6. 保存输出数据
             try:

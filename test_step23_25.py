@@ -186,36 +186,71 @@ class Step23And25Tester(VideoProcessor):
             step_outputs = {step_number: response}
             
             # save_output_data 使用 self.process_folder (assets/Process_Folder/)
-            output_folder = self.save_output_data(f"test_{step_name}", step_outputs)
+            video_name = f"test_{step_name}"
+            self.save_output_data(video_name, step_outputs)
+            
+            # 计算输出文件夹路径
+            output_folder = self.process_folder / video_name
             logger.info(f"数据已保存到: {output_folder}")
             
             # 验证保存结果
             logger.info(f"\n✅ 验证步骤 {step_number} 保存结果")
-            output_file = output_folder / f"step_{step_number}_output.xlsx"
             
-            if output_file.exists():
-                file_size = output_file.stat().st_size
-                logger.info(f"✅ 文件已创建: {output_file}")
-                logger.info(f"📊 文件大小: {file_size} 字节")
-                
-                # 读取并显示数据
-                try:
-                    df = pd.read_excel(output_file)
-                    logger.info(f"📊 数据行数: {len(df)}")
-                    logger.info(f"📊 数据列数: {len(df.columns)}")
-                    logger.info(f"📋 列名: {', '.join(df.columns.tolist())}")
-                    logger.info("\n前3行数据:")
-                    logger.info(df.head(3).to_string())
-                    
+            # 根据步骤类型检查不同的文件
+            if step_number == 23:
+                # 步骤23应该保存为SRT文件
+                srt_files = list(output_folder.glob("step_23_output_*.srt"))
+                if srt_files:
+                    logger.info(f"✅ 找到 {len(srt_files)} 个SRT文件:")
+                    for srt_file in srt_files:
+                        file_size = srt_file.stat().st_size
+                        logger.info(f"  - {srt_file.name} ({file_size} 字节)")
+                        # 显示文件内容预览
+                        with open(srt_file, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            logger.info(f"    内容预览: {content[:200]}...")
                     logger.info(f"\n🎉 步骤 {step_number} 测试成功！")
                     return True
-                    
-                except Exception as e:
-                    logger.error(f"❌ 读取Excel文件失败: {e}")
-                    return False
+                else:
+                    # 可能保存为文本文件
+                    text_file = output_folder / "step_23_output.txt"
+                    if text_file.exists():
+                        logger.warning("⚠️ 保存为文本文件而不是SRT文件")
+                        logger.info(f"✅ 文件已创建: {text_file}")
+                        with open(text_file, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            logger.info(f"内容预览: {content[:200]}...")
+                        return True
+                    else:
+                        logger.error("❌ 未找到SRT文件或文本文件")
+                        return False
             else:
-                logger.error(f"❌ 文件未创建: {output_file}")
-                return False
+                # 步骤25应该保存为Excel文件
+                output_file = output_folder / f"step_{step_number}_output.xlsx"
+                
+                if output_file.exists():
+                    file_size = output_file.stat().st_size
+                    logger.info(f"✅ 文件已创建: {output_file}")
+                    logger.info(f"📊 文件大小: {file_size} 字节")
+                    
+                    # 读取并显示数据
+                    try:
+                        df = pd.read_excel(output_file)
+                        logger.info(f"📊 数据行数: {len(df)}")
+                        logger.info(f"📊 数据列数: {len(df.columns)}")
+                        logger.info(f"📋 列名: {', '.join(df.columns.tolist())}")
+                        logger.info("\n前3行数据:")
+                        logger.info(df.head(3).to_string())
+                        
+                        logger.info(f"\n🎉 步骤 {step_number} 测试成功！")
+                        return True
+                        
+                    except Exception as e:
+                        logger.error(f"❌ 读取Excel文件失败: {e}")
+                        return False
+                else:
+                    logger.error(f"❌ 文件未创建: {output_file}")
+                    return False
                 
         except Exception as e:
             logger.error(f"❌ 步骤 {step_number} 测试失败: {e}")
