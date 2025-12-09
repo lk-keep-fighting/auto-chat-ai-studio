@@ -90,6 +90,7 @@ class Config:
     DEBUG_MODE = False  # 调试模式
     SAVE_SCREENSHOTS = True  # 是否保存截图
     SCREENSHOT_DIR = BASE_DIR / "screenshots"
+    SAVE_DEBUG_HTML = True  # 是否保存调试HTML（步骤23等）
 
 
 # 创建全局配置实例

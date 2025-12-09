@@ -85,7 +85,7 @@ class Step23And25Tester(VideoProcessor):
                 prompt="""步骤25:按输出格式输出10行测试数据
 
 【输出格式】
-请直接输出表格。表头如下：
+请直接输出标准的csv格式文件，提供复制按钮，csv表头如下：
 | start | end | folder1 | folder2 | folder3 | music | cover_time | title |""",
                 step_name="步骤25_表格数据"
             )

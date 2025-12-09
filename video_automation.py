@@ -8,6 +8,7 @@
 import os
 import sys
 import time
+import re
 import logging
 import pandas as pd
 from pathlib import Path
@@ -1545,6 +1546,13 @@ class VideoProcessor:
             if self.is_ai_running():
                 # AI 正在运行，继续等待
                 current_time = time.time()
+                
+                # 滚动到页面底部，确保AI回复内容能够正常渲染
+                try:
+                    self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                except Exception as e:
+                    logger.debug(f"滚动失败: {e}")
+                
                 if current_time - last_status_log > 10:  # 每 10 秒输出一次状态
                     elapsed_int = int(current_time - start_time)
                     logger.info(f"⏳ AI 正在处理... (已等待 {elapsed_int} 秒)")
@@ -1674,10 +1682,83 @@ class VideoProcessor:
                 except Exception as e:
                     logger.warning(f"⚠️ 检查响应文本失败: {e}")
                 
-                # 如果是步骤25，尝试直接从HTML DOM提取表格数据
-                if step_number == 25:
-                    logger.info("📊 步骤25：尝试从HTML DOM提取表格数据...")
+                # 如果是步骤23，尝试通过下载按钮获取SRT文件内容
+                if step_number == 23:
+                    logger.info("📄 步骤23：尝试通过下载按钮获取SRT文件内容...")
                     
+                    # 保存HTML用于调试（如果配置启用）
+                    if config.SAVE_DEBUG_HTML:
+                        logger.info("💾 保存步骤23的HTML内容用于调试...")
+                        self.save_response_html(last_response_element, step_number)
+                    
+                    srt_content = self.extract_srt_from_download_button(last_response_element)
+                    if srt_content:
+                        if isinstance(srt_content, list):
+                            logger.info(f"✅ 通过复制按钮获取到 {len(srt_content)} 个SRT文件")
+                        else:
+                            logger.info(f"✅ 通过下载按钮获取到 {len(srt_content)} 字符的SRT内容")
+                        return srt_content
+                    else:
+                        logger.warning("⚠️ 通过下载按钮获取SRT失败，回退到文本提取")
+                
+                # 如果是步骤25，尝试提取CSV/表格数据
+                if step_number == 25:
+                    logger.info("📊 步骤25：尝试提取CSV/表格数据...")
+                    
+                    # 滚动到响应元素，确保内容可见
+                    try:
+                        logger.info("� 滚动到响应元的素...")
+                        last_response_element.scroll_into_view_if_needed()
+                        time.sleep(1)  # 等待滚动完成
+                        logger.info("✅ 滚动完成")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 滚动失败: {e}")
+                    
+                    # 保存HTML用于调试（如果配置启用）
+                    if config.SAVE_DEBUG_HTML:
+                        logger.info("💾 保存步骤25的HTML内容用于调试...")
+                        self.save_response_html(last_response_element, step_number)
+                    
+                    # 方法1：尝试通过复制按钮获取CSV内容（推荐）
+                    logger.info("🔍 方法1：尝试通过复制按钮获取CSV内容...")
+                    csv_content = self.extract_content_by_clicking_copy_buttons(last_response_element, content_type="CSV")
+                    if csv_content:
+                        logger.info(f"✅ 通过复制按钮获取到CSV内容")
+                        # 解析CSV内容为表格数据
+                        try:
+                            import io
+                            if isinstance(csv_content, str):
+                                # 单个CSV内容
+                                # 检查是否是CSV格式（不是SRT）
+                                if '-->' in csv_content or re.search(r'\d{2}:\d{2}:\d{2},\d{3}', csv_content):
+                                    logger.warning("⚠️ 复制按钮内容是SRT格式，不是CSV，跳过")
+                                else:
+                                    df = pd.read_csv(io.StringIO(csv_content))
+                                    table_data = df.to_dict('records')
+                                    logger.info(f"✅ 解析CSV得到 {len(table_data)} 行数据")
+                                    return table_data
+                            else:
+                                # 多个CSV内容，尝试每一个
+                                logger.info(f"📋 获取到 {len(csv_content)} 个内容，尝试解析...")
+                                for i, content in enumerate(csv_content, 1):
+                                    # 检查是否是CSV格式（不是SRT）
+                                    if '-->' in content or re.search(r'\d{2}:\d{2}:\d{2},\d{3}', content):
+                                        logger.info(f"⚠️ 内容 {i} 是SRT格式，跳过")
+                                        continue
+                                    
+                                    try:
+                                        df = pd.read_csv(io.StringIO(content))
+                                        table_data = df.to_dict('records')
+                                        logger.info(f"✅ 从内容 {i} 解析CSV得到 {len(table_data)} 行数据")
+                                        return table_data
+                                    except Exception as e:
+                                        logger.warning(f"⚠️ 解析内容 {i} 失败: {e}")
+                                        continue
+                        except Exception as e:
+                            logger.warning(f"⚠️ 解析CSV失败: {e}")
+                    
+                    # 方法2：尝试从HTML DOM提取表格数据（备用）
+                    logger.info("🔍 方法2：尝试从HTML DOM提取表格数据...")
                     # 等待表格出现（最多等待10秒）
                     try:
                         logger.info("⏳ 等待表格元素出现...")
@@ -1709,6 +1790,349 @@ class VideoProcessor:
             import traceback
             logger.error(traceback.format_exc())
             return ""
+    
+    def save_response_html(self, response_element, step_number, video_name="debug"):
+        """保存响应元素的HTML内容用于调试
+        
+        Args:
+            response_element: 响应元素
+            step_number: 步骤编号
+            video_name: 视频名称
+        """
+        try:
+            # 创建调试目录
+            debug_folder = self.process_folder / video_name / "debug"
+            debug_folder.mkdir(parents=True, exist_ok=True)
+            
+            # 获取HTML内容
+            html_content = response_element.inner_html()
+            
+            # 保存HTML文件
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            html_file = debug_folder / f"step_{step_number}_response_{timestamp}.html"
+            
+            with open(html_file, "w", encoding="utf-8") as f:
+                # 添加基本的HTML结构，便于在浏览器中查看
+                f.write("<!DOCTYPE html>\n")
+                f.write("<html>\n<head>\n")
+                f.write("<meta charset='utf-8'>\n")
+                f.write(f"<title>Step {step_number} Response - {video_name}</title>\n")
+                f.write("<style>body { font-family: Arial, sans-serif; margin: 20px; }</style>\n")
+                f.write("</head>\n<body>\n")
+                f.write(f"<h1>Step {step_number} Response</h1>\n")
+                f.write(f"<p>Video: {video_name}</p>\n")
+                f.write(f"<p>Timestamp: {timestamp}</p>\n")
+                f.write("<hr>\n")
+                f.write(html_content)
+                f.write("\n</body>\n</html>")
+            
+            logger.info(f"💾 已保存HTML调试文件: {html_file.name}")
+            
+            # 同时保存纯文本内容
+            text_file = debug_folder / f"step_{step_number}_text_{timestamp}.txt"
+            text_content = response_element.inner_text()
+            with open(text_file, "w", encoding="utf-8") as f:
+                f.write(text_content)
+            
+            logger.info(f"💾 已保存文本调试文件: {text_file.name}")
+            
+            return html_file
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 保存HTML调试文件失败: {e}")
+            return None
+    
+    def extract_content_by_clicking_copy_buttons(self, response_element, content_type="通用"):
+        """通用方法：通过点击复制按钮获取剪贴板内容
+        
+        Args:
+            response_element: 响应元素
+            content_type: 内容类型（用于日志显示），如 "SRT"、"CSV"、"通用"
+            
+        Returns:
+            内容列表（如果有多个复制按钮）或单个内容字符串（如果只有一个按钮）
+        """
+        try:
+            # 查找所有复制按钮（iconname="content_copy"）
+            copy_buttons = response_element.locator('button[iconname="content_copy"]').all()
+            
+            if not copy_buttons:
+                logger.warning("⚠️ 未找到复制按钮")
+                return None
+            
+            logger.info(f"🔍 找到 {len(copy_buttons)} 个复制按钮")
+            
+            contents = []
+            
+            for i, button in enumerate(copy_buttons):
+                try:
+                    logger.info(f"📋 点击复制按钮 {i+1}/{len(copy_buttons)}...")
+                    
+                    # 点击复制按钮
+                    button.click()
+                    
+                    # 等待剪贴板更新
+                    time.sleep(0.5)
+                    
+                    # 获取剪贴板内容
+                    # 使用 Playwright 的 evaluate 方法读取剪贴板
+                    clipboard_content = self.page.evaluate('''
+                        async () => {
+                            try {
+                                return await navigator.clipboard.readText();
+                            } catch (e) {
+                                return null;
+                            }
+                        }
+                    ''')
+                    
+                    if clipboard_content:
+                        logger.info(f"✅ 从复制按钮 {i+1} 获取到 {len(clipboard_content)} 字符的{content_type}内容")
+                        contents.append(clipboard_content)
+                    else:
+                        logger.warning(f"⚠️ 无法从复制按钮 {i+1} 获取剪贴板内容")
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ 点击复制按钮 {i+1} 失败: {e}")
+                    continue
+            
+            if contents:
+                logger.info(f"✅ 总共获取了 {len(contents)} 个{content_type}内容")
+                # 如果只有一个内容，返回字符串；否则返回列表
+                return contents[0] if len(contents) == 1 else contents
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ 通过复制按钮获取{content_type}内容失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
+    
+    def extract_srt_by_clicking_copy_buttons(self, response_element):
+        """通过点击复制按钮获取SRT剪贴板内容（带格式验证）
+        
+        Args:
+            response_element: 响应元素
+            
+        Returns:
+            SRT文件内容列表，每个元素是一个SRT文件的内容
+        """
+        try:
+            # 查找所有复制按钮（iconname="content_copy"）
+            copy_buttons = response_element.locator('button[iconname="content_copy"]').all()
+            
+            if not copy_buttons:
+                logger.warning("⚠️ 未找到复制按钮")
+                return None
+            
+            logger.info(f"🔍 找到 {len(copy_buttons)} 个复制按钮")
+            
+            srt_contents = []
+            
+            for i, button in enumerate(copy_buttons):
+                try:
+                    logger.info(f"📋 点击复制按钮 {i+1}/{len(copy_buttons)}...")
+                    
+                    # 点击复制按钮
+                    button.click()
+                    
+                    # 等待剪贴板更新
+                    time.sleep(0.5)
+                    
+                    # 获取剪贴板内容
+                    # 使用 Playwright 的 evaluate 方法读取剪贴板
+                    clipboard_content = self.page.evaluate('''
+                        async () => {
+                            try {
+                                return await navigator.clipboard.readText();
+                            } catch (e) {
+                                return null;
+                            }
+                        }
+                    ''')
+                    
+                    if clipboard_content:
+                        # 检查是否是SRT格式
+                        if '-->' in clipboard_content and re.search(r'\d{2}:\d{2}:\d{2},\d{3}', clipboard_content):
+                            logger.info(f"✅ 从复制按钮 {i+1} 获取到 {len(clipboard_content)} 字符的SRT内容")
+                            srt_contents.append(clipboard_content)
+                        else:
+                            logger.warning(f"⚠️ 复制按钮 {i+1} 的内容不是SRT格式")
+                    else:
+                        logger.warning(f"⚠️ 无法从复制按钮 {i+1} 获取剪贴板内容")
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ 点击复制按钮 {i+1} 失败: {e}")
+                    continue
+            
+            if srt_contents:
+                logger.info(f"✅ 总共获取了 {len(srt_contents)} 个SRT文件的内容")
+                return srt_contents
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ 通过复制按钮获取SRT内容失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
+    
+    def extract_srt_from_download_button(self, response_element):
+        """通过复制按钮获取SRT文件内容
+        
+        Args:
+            response_element: 响应元素
+            
+        Returns:
+            SRT文件内容（字符串或列表），如果失败则返回None
+        """
+        try:
+            # 方法1：通过点击复制按钮获取剪贴板内容（推荐）
+            logger.info("🔍 方法1：尝试通过点击复制按钮获取剪贴板内容...")
+            srt_contents = self.extract_srt_by_clicking_copy_buttons(response_element)
+            if srt_contents:
+                # 如果获取到多个SRT文件，合并它们
+                if len(srt_contents) > 1:
+                    logger.info(f"✅ 获取到 {len(srt_contents)} 个SRT文件")
+                    # 返回列表，让调用者分别保存
+                    return srt_contents
+                else:
+                    return srt_contents[0]
+            
+            # 方法2：从表格中提取SRT内容（备用）
+            logger.info("🔍 方法2：尝试从表格中提取SRT内容...")
+            srt_content = self.extract_srt_from_table(response_element)
+            if srt_content:
+                logger.info(f"✅ 从表格中提取到SRT内容")
+                return srt_content
+            
+            # 方法3：查找代码块
+            logger.info("🔍 方法3：尝试从代码块中提取SRT内容...")
+            code_blocks = response_element.locator('pre, code, [class*="code"]').all()
+            
+            if code_blocks:
+                logger.info(f"🔍 找到 {len(code_blocks)} 个代码块")
+                
+                for i, block in enumerate(code_blocks):
+                    try:
+                        content = block.inner_text()
+                        if '-->' in content and re.search(r'\d{2}:\d{2}:\d{2},\d{3}', content):
+                            logger.info(f"✅ 在代码块 {i} 中找到SRT内容")
+                            return content
+                    except Exception as e:
+                        logger.debug(f"检查代码块 {i} 失败: {e}")
+            
+            # 方法4：从响应文本中搜索
+            logger.info("🔍 方法4：尝试从响应文本中搜索SRT格式...")
+            full_text = response_element.inner_text()
+            if '-->' in full_text and re.search(r'\d{2}:\d{2}:\d{2},\d{3}', full_text):
+                logger.info("✅ 在响应文本中找到SRT格式内容")
+                # 提取SRT部分（从第一个时间戳开始）
+                match = re.search(r'(\d+\s+\d{2}:\d{2}:\d{2},\d{3}\s+-->.*)', full_text, re.DOTALL)
+                if match:
+                    return match.group(1)
+                return full_text
+            
+            logger.warning("⚠️ 所有方法都未找到SRT内容")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ 提取SRT内容失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
+    
+    def extract_srt_from_table(self, response_element):
+        """从表格中提取SRT内容
+        
+        Args:
+            response_element: 响应元素
+            
+        Returns:
+            SRT文件内容（字符串），如果失败则返回None
+        """
+        try:
+            # 查找所有表格
+            tables = response_element.locator('table').all()
+            if not tables:
+                logger.debug("未找到表格元素")
+                return None
+            
+            logger.info(f"📋 找到 {len(tables)} 个表格")
+            
+            all_srt_content = []
+            
+            for table_idx, table in enumerate(tables):
+                try:
+                    # 获取所有行
+                    rows = table.locator('tr').all()
+                    if len(rows) < 2:  # 至少需要表头和一行数据
+                        continue
+                    
+                    # 检查表头是否包含SRT相关列（序号、时间戳、内容）
+                    header_row = rows[0]
+                    header_text = header_row.inner_text().lower()
+                    
+                    # 判断是否是SRT表格
+                    is_srt_table = ('时间戳' in header_text or 'timestamp' in header_text) and \
+                                   ('序号' in header_text or '内容' in header_text or 'content' in header_text)
+                    
+                    if not is_srt_table:
+                        logger.debug(f"表格 {table_idx} 不是SRT表格")
+                        continue
+                    
+                    logger.info(f"✅ 表格 {table_idx} 是SRT表格，开始提取...")
+                    
+                    # 提取数据行（跳过表头）
+                    srt_entries = []
+                    for row_idx, row in enumerate(rows[1:], 1):
+                        try:
+                            cells = row.locator('td').all()
+                            if len(cells) < 3:
+                                continue
+                            
+                            # 提取序号、时间戳、内容
+                            seq_num = cells[0].inner_text().strip()
+                            timestamp = cells[1].inner_text().strip()
+                            content = cells[2].inner_text().strip()
+                            
+                            # 清理时间戳格式（可能包含数学符号）
+                            # 将 "−−>" 转换为 "-->"
+                            timestamp = timestamp.replace('−', '-').replace('—', '--')
+                            if '-->' not in timestamp:
+                                timestamp = timestamp.replace('--', ' --> ')
+                            
+                            # 构建SRT条目
+                            srt_entry = f"{seq_num}\n{timestamp}\n{content}\n"
+                            srt_entries.append(srt_entry)
+                            
+                        except Exception as e:
+                            logger.debug(f"提取行 {row_idx} 失败: {e}")
+                            continue
+                    
+                    if srt_entries:
+                        table_srt = '\n'.join(srt_entries)
+                        all_srt_content.append(table_srt)
+                        logger.info(f"✅ 从表格 {table_idx} 提取了 {len(srt_entries)} 个SRT条目")
+                
+                except Exception as e:
+                    logger.debug(f"处理表格 {table_idx} 失败: {e}")
+                    continue
+            
+            if all_srt_content:
+                # 合并所有SRT内容
+                combined_srt = '\n'.join(all_srt_content)
+                logger.info(f"✅ 总共提取了 {len(all_srt_content)} 个SRT文件的内容")
+                return combined_srt
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ 从表格提取SRT失败: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
     
     def extract_table_from_dom(self, response_element):
         """从HTML DOM中直接提取表格数据"""
@@ -2014,7 +2438,7 @@ class VideoProcessor:
         """从文本中提取并保存SRT文件
         
         Args:
-            text_content: 包含SRT内容的文本
+            text_content: 包含SRT内容的文本（字符串）或SRT内容列表（列表）
             output_folder: 输出文件夹
             
         Returns:
@@ -2025,6 +2449,18 @@ class VideoProcessor:
         srt_files = []
         
         try:
+            # 如果输入是列表（从复制按钮获取的多个SRT文件）
+            if isinstance(text_content, list):
+                logger.info(f"📋 处理 {len(text_content)} 个SRT文件（来自复制按钮）")
+                for i, srt_content in enumerate(text_content, 1):
+                    # 清理每个SRT内容
+                    srt_content = self._clean_srt_content(srt_content)
+                    srt_file = output_folder / f"step_23_output_{i}.srt"
+                    with open(srt_file, "w", encoding="utf-8") as f:
+                        f.write(srt_content.strip())
+                    srt_files.append(srt_file)
+                    logger.info(f"✅ 保存SRT文件 {i}: {srt_file.name} ({len(srt_content)} 字符)")
+                return srt_files
             # 清理文本：移除UI元素（如按钮文本）
             # 常见的UI元素关键词
             ui_keywords = [
@@ -2059,9 +2495,14 @@ class VideoProcessor:
                         text_content = text_content[first_timestamp_match.start():].strip()
                         logger.info(f"✂️ 清理后的内容长度: {len(text_content)} 字符")
             
-            # 方法1：查找明确标记的SRT文件（如 "文件1:" 或 "File 1:"）
+            # 方法1：查找明确标记的SRT文件（如 "文件1:" 或 "File 1:" 或 "SRT 文件 1："）
             # 分割文本，查找多个SRT块
-            srt_pattern = r'(?:文件|File|SRT)\s*(\d+)[：:](.*?)(?=(?:文件|File|SRT)\s*\d+[：:]|$)'
+            # 支持多种格式：
+            # - "文件1:" 或 "文件 1:"
+            # - "File 1:" 或 "File1:"
+            # - "SRT 1:" 或 "SRT1:"
+            # - "SRT 文件 1:" 或 "SRT文件1:"
+            srt_pattern = r'(?:SRT\s*文件|文件|File|SRT)\s*(\d+)\s*[：:](.*?)(?=(?:SRT\s*文件|文件|File|SRT)\s*\d+\s*[：:]|$)'
             matches = re.findall(srt_pattern, text_content, re.DOTALL | re.IGNORECASE)
             
             if matches:
@@ -2136,7 +2577,7 @@ class VideoProcessor:
                 continue
 
             # 步骤23特殊处理：保存为SRT文件
-            if step_num == 23 and isinstance(data, str):
+            if step_num == 23 and (isinstance(data, str) or isinstance(data, list)):
                 try:
                     srt_files = self.extract_and_save_srt_files(data, output_folder)
                     if srt_files:
@@ -2148,7 +2589,10 @@ class VideoProcessor:
                         # 回退到保存为文本文件
                         text_file = output_folder / f"step_{step_num}_output.txt"
                         with open(text_file, "w", encoding="utf-8") as f:
-                            f.write(data)
+                            if isinstance(data, list):
+                                f.write('\n\n=== 文件分隔 ===\n\n'.join(data))
+                            else:
+                                f.write(data)
                         logger.info(f"✅ 已保存为文本文件: {text_file.name}")
                     continue
                 except Exception as e:
