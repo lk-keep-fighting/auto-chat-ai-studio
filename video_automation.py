@@ -1919,6 +1919,97 @@ class VideoProcessor:
             logger.debug(traceback.format_exc())
             return None
 
+    def _clean_srt_content(self, srt_text):
+        """清理SRT内容，移除UI元素和无关文本
+        
+        Args:
+            srt_text: 原始SRT文本
+            
+        Returns:
+            清理后的SRT文本
+        """
+        import re
+        
+        # 查找第一个SRT序号和时间戳
+        first_entry_match = re.search(r'^(\d+)\s+(\d{2}:\d{2}:\d{2},\d{3}\s+-->)', srt_text, re.MULTILINE)
+        
+        if first_entry_match:
+            # 从第一个SRT条目开始提取
+            start_pos = first_entry_match.start()
+            cleaned_text = srt_text[start_pos:].strip()
+            
+            # 移除末尾的UI元素和下一个文件的标题
+            # 策略：找到最后一个有效的SRT条目，移除之后的所有内容
+            lines = cleaned_text.split('\n')
+            
+            # 查找最后一个完整的SRT条目
+            # 完整的SRT条目包含：序号 + 时间戳 + 至少一行文本
+            last_subtitle_end = -1
+            i = 0
+            
+            while i < len(lines):
+                line = lines[i].strip()
+                
+                # 检查是否是序号（纯数字）
+                if re.match(r'^\d+$', line):
+                    # 检查下一行是否是时间戳
+                    if i + 1 < len(lines) and re.match(r'^\d{2}:\d{2}:\d{2},\d{3}\s+-->', lines[i + 1].strip()):
+                        # 找到一个SRT条目的开始
+                        # 查找这个条目的结束位置（下一个空行或文件结束）
+                        j = i + 2  # 从时间戳的下一行开始（字幕文本）
+                        subtitle_text_found = False
+                        
+                        while j < len(lines):
+                            current_line = lines[j].strip()
+                            
+                            # 空行表示条目结束
+                            if not current_line:
+                                if subtitle_text_found:
+                                    last_subtitle_end = j
+                                break
+                            
+                            # 检查是否是UI元素或无关内容
+                            is_ui_element = (
+                                current_line in ['code', 'Srt', 'download', 'content_copy', 'expand_less', 'expand_more'] or
+                                re.match(r'^(?:SRT\s*)?(?:文件|File)\s*[A-Z\d一二三四五六七八九十]+[：:]', current_line, re.IGNORECASE) or
+                                'Google Search' in current_line or
+                                'Display of Search' in current_line or
+                                re.match(r'^Step\s+\d+', current_line)
+                            )
+                            
+                            if is_ui_element:
+                                # 遇到UI元素，当前条目在此结束
+                                if subtitle_text_found:
+                                    last_subtitle_end = j
+                                break
+                            else:
+                                # 这是字幕文本
+                                subtitle_text_found = True
+                            
+                            j += 1
+                        else:
+                            # 到达文件末尾
+                            if subtitle_text_found:
+                                last_subtitle_end = len(lines)
+                        
+                        # 跳到这个条目之后
+                        i = j
+                        continue
+                
+                i += 1
+            
+            # 如果找到了有效的字幕条目，截取到最后一个条目
+            if last_subtitle_end > 0:
+                cleaned_text = '\n'.join(lines[:last_subtitle_end]).strip()
+                removed_lines = len(lines) - last_subtitle_end
+                if removed_lines > 0:
+                    logger.debug(f"✂️ 移除了末尾的 {removed_lines} 行无关内容")
+            
+            return cleaned_text
+        
+        # 如果没找到标准格式，返回原文本
+        return srt_text.strip()
+    
     def extract_and_save_srt_files(self, text_content, output_folder):
         """从文本中提取并保存SRT文件
         
@@ -1934,6 +2025,40 @@ class VideoProcessor:
         srt_files = []
         
         try:
+            # 清理文本：移除UI元素（如按钮文本）
+            # 常见的UI元素关键词
+            ui_keywords = [
+                'code', 'Srt', 'download', 'content_copy', 'expand_less', 'expand_more',
+                'Copy code', 'Download', 'Show more', 'Show less'
+            ]
+            
+            # 查找第一个SRT时间戳的位置
+            first_timestamp_match = re.search(r'\d+\s+\d{2}:\d{2}:\d{2},\d{3}\s+-->', text_content)
+            
+            if first_timestamp_match:
+                # 从第一个时间戳之前开始查找，移除UI元素
+                before_timestamp = text_content[:first_timestamp_match.start()]
+                
+                # 查找 expand_less 或类似的标记
+                expand_less_pos = before_timestamp.rfind('expand_less')
+                if expand_less_pos == -1:
+                    expand_less_pos = before_timestamp.rfind('expand_more')
+                
+                if expand_less_pos != -1:
+                    # 从 expand_less 之后开始提取内容
+                    logger.info(f"🔍 检测到UI元素标记，从位置 {expand_less_pos} 之后开始提取")
+                    text_content = text_content[expand_less_pos + len('expand_less'):].strip()
+                    logger.info(f"✂️ 清理后的内容长度: {len(text_content)} 字符")
+                else:
+                    # 尝试查找标题行（通常在第一个时间戳之前）
+                    # 移除第一个时间戳之前的所有内容（标题、按钮等）
+                    lines_before = before_timestamp.strip().split('\n')
+                    if len(lines_before) > 3:  # 如果有多行，可能包含UI元素
+                        logger.info(f"🔍 检测到 {len(lines_before)} 行前置内容，尝试清理")
+                        # 保留标题行（通常是第一行），移除其他UI元素
+                        text_content = text_content[first_timestamp_match.start():].strip()
+                        logger.info(f"✂️ 清理后的内容长度: {len(text_content)} 字符")
+            
             # 方法1：查找明确标记的SRT文件（如 "文件1:" 或 "File 1:"）
             # 分割文本，查找多个SRT块
             srt_pattern = r'(?:文件|File|SRT)\s*(\d+)[：:](.*?)(?=(?:文件|File|SRT)\s*\d+[：:]|$)'
@@ -1942,6 +2067,8 @@ class VideoProcessor:
             if matches:
                 logger.info(f"📋 找到 {len(matches)} 个标记的SRT文件")
                 for i, (file_num, srt_content) in enumerate(matches, 1):
+                    # 清理每个SRT内容
+                    srt_content = self._clean_srt_content(srt_content)
                     srt_file = output_folder / f"step_23_output_{file_num}.srt"
                     with open(srt_file, "w", encoding="utf-8") as f:
                         f.write(srt_content.strip())
@@ -1967,6 +2094,8 @@ class VideoProcessor:
                         
                         for i, part in enumerate(parts, 1):
                             if part:
+                                # 清理每个SRT内容
+                                part = self._clean_srt_content(part)
                                 srt_file = output_folder / f"step_23_output_{i}.srt"
                                 with open(srt_file, "w", encoding="utf-8") as f:
                                     f.write(part)
@@ -1974,6 +2103,7 @@ class VideoProcessor:
                                 logger.info(f"✅ 保存SRT文件 {i}: {srt_file.name} ({len(part)} 字符)")
                     else:
                         # 单个SRT文件
+                        text_content = self._clean_srt_content(text_content)
                         srt_file = output_folder / "step_23_output_1.srt"
                         with open(srt_file, "w", encoding="utf-8") as f:
                             f.write(text_content.strip())
