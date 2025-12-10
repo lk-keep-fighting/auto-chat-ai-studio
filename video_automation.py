@@ -752,6 +752,12 @@ class VideoProcessor:
         """
         step_info = f"步骤 {step_number}" if step_number else "提示词"
         logger.info(f"📝 发送{step_info}: {prompt_text[:50]}...")
+        
+        # 在发送提示词之前，滚动到底部确保能看到对话框
+        try:
+            self.scroll_chat_to_bottom()
+        except Exception as e:
+            logger.debug(f"滚动到底部失败: {e}")
 
         try:
             # 尝试多个可能的输入框选择器
@@ -1432,6 +1438,55 @@ class VideoProcessor:
             logger.debug(f"检查 AI 运行状态时出错: {e}")
             return False
     
+    def scroll_chat_to_bottom(self):
+        """滚动聊天容器到底部，确保能看到最新内容"""
+        try:
+            # 方法1：点击自定义滚动条的最后一个按钮（最重要）
+            try:
+                # 查找所有滚动条按钮
+                scrollbar_buttons = self.page.locator('ms-prompt-scrollbar button.prompt-scrollbar-item, ms-prompt-scrollbar button[id^="scrollbar-item-"]').all()
+                if scrollbar_buttons and len(scrollbar_buttons) > 0:
+                    # 点击最后一个按钮
+                    last_button = scrollbar_buttons[-1]
+                    last_button.click(timeout=3000)
+                    logger.info(f"🔄 已点击滚动条的最后一个按钮（共 {len(scrollbar_buttons)} 个按钮）")
+                    time.sleep(0.5)
+                else:
+                    logger.debug("⚠️ 未找到滚动条按钮")
+            except Exception as e:
+                logger.debug(f"⚠️ 点击滚动条按钮失败: {e}")
+            
+            # 方法2：尝试滚动到页面底部
+            try:
+                self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                logger.debug("🔄 已滚动到页面底部")
+                time.sleep(0.3)
+            except Exception as e:
+                logger.debug(f"⚠️ 滚动页面失败: {e}")
+            
+            # 方法3：尝试通过JavaScript滚动聊天容器内部
+            try:
+                # 查找并滚动 ms-autoscroll-container 元素
+                scroll_script = """
+                const container = document.querySelector('ms-autoscroll-container');
+                if (container) {
+                    container.scrollTop = container.scrollHeight;
+                    return true;
+                }
+                return false;
+                """
+                scrolled = self.page.evaluate(scroll_script)
+                if scrolled:
+                    logger.debug("🔄 已滚动自动滚动容器到底部")
+            except Exception as e:
+                logger.debug(f"⚠️ 滚动自动滚动容器失败: {e}")
+            
+            # 等待一小段时间让滚动生效
+            time.sleep(0.5)
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 滚动到底部时出错: {e}")
+    
     def verify_response_complete(self, step_number=None):
         """验证响应是否完整"""
         try:
@@ -1547,11 +1602,8 @@ class VideoProcessor:
                 # AI 正在运行，继续等待
                 current_time = time.time()
                 
-                # 滚动到页面底部，确保AI回复内容能够正常渲染
-                try:
-                    self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                except Exception as e:
-                    logger.debug(f"滚动失败: {e}")
+                # 滚动聊天到底部，确保能看到最新内容
+                self.scroll_chat_to_bottom()
                 
                 if current_time - last_status_log > 10:  # 每 10 秒输出一次状态
                     elapsed_int = int(current_time - start_time)
@@ -1629,6 +1681,9 @@ class VideoProcessor:
 
     def extract_response(self, step_number=None):
         """提取 AI 的响应内容"""
+        # 滚动聊天到底部，确保能看到最新内容
+        self.scroll_chat_to_bottom()
+        
         try:
             # 获取最后的响应内容（使用正确的选择器）
             responses = self.page.locator('[data-turn-role="Model"]').all()
@@ -1727,27 +1782,119 @@ class VideoProcessor:
                         # 解析CSV内容为表格数据
                         try:
                             import io
+                            import csv
                             if isinstance(csv_content, str):
                                 # 单个CSV内容
                                 # 检查是否是CSV格式（不是SRT）
-                                if '-->' in csv_content or re.search(r'\d{2}:\d{2}:\d{2},\d{3}', csv_content):
+                                # SRT格式的特征：包含 --> 时间箭头和 SRT 序号行
+                                is_srt = ('-->' in csv_content and 
+                                         re.search(r'^\d+$', csv_content.split('\n')[0] if csv_content.split('\n') else '', re.MULTILINE))
+                                
+                                if is_srt:
                                     logger.warning("⚠️ 复制按钮内容是SRT格式，不是CSV，跳过")
                                 else:
-                                    df = pd.read_csv(io.StringIO(csv_content))
-                                    table_data = df.to_dict('records')
-                                    logger.info(f"✅ 解析CSV得到 {len(table_data)} 行数据")
-                                    return table_data
+                                    # 修复CSV中的时间格式问题：将 00:00:00,000 改为 00:00:00.000
+                                    # 因为CSV使用逗号分隔，时间中的逗号会被误认为列分隔符
+                                    csv_content = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', csv_content)
+                                    
+                                    # 去除每行尾部的多余逗号，避免列数不匹配
+                                    lines = csv_content.strip().split('\n')
+                                    cleaned_lines = [line.rstrip(',') for line in lines]
+                                    csv_content = '\n'.join(cleaned_lines)
+                                    
+                                    logger.debug("🔧 已修复CSV格式（时间逗号改点号，去除行尾逗号）")
+                                    
+                                    # 使用更健壮的CSV解析方法
+                                    try:
+                                        # 先尝试使用pandas解析，使用更宽松的参数来处理列数不一致的问题
+                                        df = pd.read_csv(io.StringIO(csv_content), on_bad_lines='skip')
+                                        table_data = df.to_dict('records')
+                                        logger.info(f"✅ 解析CSV得到 {len(table_data)} 行数据")
+                                        return table_data
+                                    except Exception as e:
+                                        logger.warning(f"⚠️ 使用pandas解析CSV失败: {e}")
+                                        # 如果pandas解析失败，尝试手动解析并清洗数据
+                                        lines = csv_content.strip().split('\n')
+                                        if len(lines) < 2:
+                                            logger.warning("⚠️ CSV内容行数不足")
+                                            return None
+                                        
+                                        # 解析表头
+                                        header = lines[0].split(',')
+                                        header = [h.strip() for h in header]
+                                        logger.info(f"📋 CSV表头: {header}")
+                                        
+                                        # 解析数据行
+                                        table_data = []
+                                        for i, line in enumerate(lines[1:], 1):
+                                            try:
+                                                # 使用csv模块解析，处理引号和转义字符
+                                                reader = csv.reader([line])
+                                                row_data = next(reader)
+                                                
+                                                # 创建行字典，处理列数不匹配的情况
+                                                row_dict = {}
+                                                # 如果列数过多，丢弃后面多出的列（因为这些多出的列数据是空的）
+                                                actual_data_length = len(row_data)
+                                                header_length = len(header)
+                                                
+                                                # 处理列数不匹配的情况
+                                                for j, header_col in enumerate(header):
+                                                    if j < actual_data_length:
+                                                        row_dict[header_col] = row_data[j].strip()
+                                                    else:
+                                                        row_dict[header_col] = ""  # 填充空值
+                                                
+                                                # 如果数据列比表头列多，检查多出的列是否都是空的，如果是则忽略
+                                                if actual_data_length > header_length:
+                                                    extra_columns_empty = True
+                                                    for j in range(header_length, actual_data_length):
+                                                        if row_data[j].strip():
+                                                            extra_columns_empty = False
+                                                            break
+                                                    
+                                                    if extra_columns_empty:
+                                                        logger.debug(f"  行 {i}: 发现 {actual_data_length - header_length} 个多余的空列，已丢弃")
+                                                    else:
+                                                        logger.debug(f"  行 {i}: 发现 {actual_data_length - header_length} 个多余的非空列")
+                                                
+                                                table_data.append(row_dict)
+                                                logger.debug(f"  行 {i}: {row_dict}")
+                                            except Exception as line_e:
+                                                logger.warning(f"⚠️ 解析行 {i} 失败: {line_e}")
+                                                continue
+                                        
+                                        if table_data:
+                                            logger.info(f"✅ 手动解析CSV得到 {len(table_data)} 行数据")
+                                            return table_data
+                                        else:
+                                            logger.warning("⚠️ 手动解析未获得有效数据")
                             else:
                                 # 多个CSV内容，尝试每一个
                                 logger.info(f"📋 获取到 {len(csv_content)} 个内容，尝试解析...")
                                 for i, content in enumerate(csv_content, 1):
                                     # 检查是否是CSV格式（不是SRT）
-                                    if '-->' in content or re.search(r'\d{2}:\d{2}:\d{2},\d{3}', content):
+                                    # SRT格式的特征：包含 --> 时间箭头和 SRT 序号行
+                                    is_srt = ('-->' in content and 
+                                             re.search(r'^\d+$', content.split('\n')[0] if content.split('\n') else '', re.MULTILINE))
+                                    
+                                    if is_srt:
                                         logger.info(f"⚠️ 内容 {i} 是SRT格式，跳过")
                                         continue
                                     
+                                    # 修复CSV中的时间格式问题：将 00:00:00,000 改为 00:00:00.000
+                                    content = re.sub(r'(\d{2}:\d{2}:\d{2}),(\d{3})', r'\1.\2', content)
+                                    
+                                    # 去除每行尾部的多余逗号，避免列数不匹配
+                                    lines = content.strip().split('\n')
+                                    cleaned_lines = [line.rstrip(',') for line in lines]
+                                    content = '\n'.join(cleaned_lines)
+                                    
+                                    logger.debug(f"🔧 内容 {i}: 已修复CSV格式")
+                                    
                                     try:
-                                        df = pd.read_csv(io.StringIO(content))
+                                        # 使用更宽松的参数来处理列数不一致的问题
+                                        df = pd.read_csv(io.StringIO(content), on_bad_lines='skip')
                                         table_data = df.to_dict('records')
                                         logger.info(f"✅ 从内容 {i} 解析CSV得到 {len(table_data)} 行数据")
                                         return table_data
@@ -2327,10 +2474,71 @@ class VideoProcessor:
             # 方法3：尝试解析 CSV 格式
             try:
                 import io
-                csv_data = pd.read_csv(io.StringIO(response_text))
-                if not csv_data.empty:
-                    logger.info(f"✅ 解析到 {len(csv_data)} 行 CSV 数据")
-                    return csv_data.to_dict('records')
+                import csv
+                try:
+                    # 使用更宽松的参数来处理列数不一致的问题
+                    csv_data = pd.read_csv(io.StringIO(response_text), on_bad_lines='skip')
+                    if not csv_data.empty:
+                        logger.info(f"✅ 解析到 {len(csv_data)} 行 CSV 数据")
+                        return csv_data.to_dict('records')
+                except Exception as e:
+                    logger.warning(f"⚠️ 使用pandas解析CSV失败: {e}")
+                    # 如果pandas解析失败，尝试手动解析并清洗数据
+                    lines = response_text.strip().split('\n')
+                    if len(lines) < 2:
+                        logger.warning("⚠️ CSV内容行数不足")
+                        return None
+                    
+                    # 解析表头
+                    header = lines[0].split(',')
+                    header = [h.strip() for h in header]
+                    logger.info(f"📋 CSV表头: {header}")
+                    
+                    # 解析数据行
+                    table_data = []
+                    for i, line in enumerate(lines[1:], 1):
+                        try:
+                            # 使用csv模块解析，处理引号和转义字符
+                            reader = csv.reader([line])
+                            row_data = next(reader)
+                            
+                            # 创建行字典，处理列数不匹配的情况
+                            row_dict = {}
+                            # 如果列数过多，丢弃后面多出的列（因为这些多出的列数据是空的）
+                            actual_data_length = len(row_data)
+                            header_length = len(header)
+                            
+                            # 处理列数不匹配的情况
+                            for j, header_col in enumerate(header):
+                                if j < actual_data_length:
+                                    row_dict[header_col] = row_data[j].strip()
+                                else:
+                                    row_dict[header_col] = ""  # 填充空值
+                            
+                            # 如果数据列比表头列多，检查多出的列是否都是空的，如果是则忽略
+                            if actual_data_length > header_length:
+                                extra_columns_empty = True
+                                for j in range(header_length, actual_data_length):
+                                    if row_data[j].strip():
+                                        extra_columns_empty = False
+                                        break
+                                
+                                if extra_columns_empty:
+                                    logger.debug(f"  行 {i}: 发现 {actual_data_length - header_length} 个多余的空列，已丢弃")
+                                else:
+                                    logger.debug(f"  行 {i}: 发现 {actual_data_length - header_length} 个多余的非空列")
+                            
+                            table_data.append(row_dict)
+                            logger.debug(f"  行 {i}: {row_dict}")
+                        except Exception as line_e:
+                            logger.warning(f"⚠️ 解析行 {i} 失败: {line_e}")
+                            continue
+                    
+                    if table_data:
+                        logger.info(f"✅ 手动解析CSV得到 {len(table_data)} 行数据")
+                        return table_data
+                    else:
+                        logger.warning("⚠️ 手动解析未获得有效数据")
             except:
                 pass
             

@@ -82,7 +82,7 @@ class Step23And25Tester(VideoProcessor):
             
             step25_result = self.test_single_step(
                 step_number=25,
-                prompt="""步骤25:按输出格式输出10行测试数据
+                prompt="""步骤25:按输出格式输出10行测试数据,列数据随机为空
 
 【输出格式】
 请直接输出标准的csv格式文件，提供复制按钮，csv表头如下：
